@@ -85,9 +85,7 @@ DBOptions SanitizeOptions(const std::string& dbname, const DBOptions& src) {
     }
   }
 
-  if (result.WAL_ttl_seconds > 0 || result.WAL_size_limit_MB > 0) {
-    result.recycle_log_file_num = false;
-  }
+  result.recycle_log_file_num = false;
   if (result.max_total_wal_size > 0 &&
       result.max_wal_size > result.max_total_wal_size) {
     result.max_wal_size = result.max_total_wal_size / 4;
@@ -102,11 +100,6 @@ DBOptions SanitizeOptions(const std::string& dbname, const DBOptions& src) {
     // kAbsoluteConsistency doesn't make sense because even a clean
     // shutdown leaves old junk at the end of the log file.
     result.wal_recovery_mode = WALRecoveryMode::kTolerateCorruptedTailRecords;
-  }
-
-  if (result.recycle_log_file_num && result.prepare_log_writer_num) {
-    result.recycle_log_file_num =
-        std::max(result.prepare_log_writer_num, result.recycle_log_file_num);
   }
 
   if (result.wal_dir.empty()) {
@@ -155,6 +148,8 @@ DBOptions SanitizeOptions(const std::string& dbname, const DBOptions& src) {
     result.sst_file_manager = sst_file_manager;
   }
 #endif
+  result.blob_cache = NewLRUCache(src.blob_cache_size);
+
   return result;
 }
 
@@ -260,7 +255,7 @@ Status DBImpl::NewDB() {
     std::unique_ptr<WritableFileWriter> file_writer(new WritableFileWriter(
         std::move(file), manifest, env_options, nullptr /* stats */,
         immutable_db_options_.listeners));
-    log::Writer log(std::move(file_writer), 0, false);
+    log::Writer log(std::move(file_writer), 0, false, versions_.get());
     std::string record;
     new_db.EncodeTo(&record);
     s = log.AddRecord(record);
@@ -782,9 +777,10 @@ Status DBImpl::RecoverLogFiles(const std::vector<uint64_t>& log_numbers,
       // That's why we set ignore missing column families to true
       bool has_valid_writes = false;
       status = WriteBatchInternal::InsertInto(
-          &batch, column_family_memtables_.get(), &flush_scheduler_, true,
-          log_number, this, false /* concurrent_memtable_writes */,
-          next_sequence, &has_valid_writes, seq_per_batch_, batch_per_txn_);
+          &batch, column_family_memtables_.get(), &flush_scheduler_,
+          false /*enable_kv_separate*/, true, log_number, this,
+          false /* concurrent_memtable_writes */, next_sequence,
+          &has_valid_writes, seq_per_batch_, batch_per_txn_);
       MaybeIgnoreError(&status);
       if (!status.ok()) {
         // We are treating this as a failure while reading since we read valid

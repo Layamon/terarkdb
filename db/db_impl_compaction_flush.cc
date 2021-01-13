@@ -6,6 +6,10 @@
 // Copyright (c) 2011 The LevelDB Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
+#include <atomic>
+#include <type_traits>
+#include <unordered_map>
+
 #include "db/db_impl.h"
 
 #ifndef __STDC_FORMAT_MACROS
@@ -14,6 +18,7 @@
 #include <inttypes.h>
 
 #include "db/builder.h"
+#include "db/compaction_picker.h"
 #include "db/error_handler.h"
 #include "db/event_helpers.h"
 #include "db/map_builder.h"
@@ -110,8 +115,9 @@ Status DBImpl::SyncClosedLogs(JobContext* job_context) {
 
 Status DBImpl::FlushMemTableToOutputFile(
     ColumnFamilyData* cfd, const MutableCFOptions& mutable_cf_options,
-    bool* made_progress, JobContext* job_context,
-    SuperVersionContext* superversion_context, LogBuffer* log_buffer) {
+    const ImmutableDBOptions& immutable_db_options, bool* made_progress,
+    JobContext* job_context, SuperVersionContext* superversion_context,
+    LogBuffer* log_buffer) {
   mutex_.AssertHeld();
   // TODO(ZouZhiZhang) find out Assertion reason
   // assert(cfd->imm()->NumNotFlushed() != 0);
@@ -200,8 +206,14 @@ Status DBImpl::FlushMemTableToOutputFile(
     if (sfm) {
       // Notify sst_file_manager that a new file was added
       for (auto file_meta : flush_job.GetFileMetas()) {
-        std::string file_path = MakeTableFileName(
-            cfd->ioptions()->cf_paths[0].path, file_meta.fd.GetNumber());
+        std::string file_path;
+        if (file_meta.prop.is_blob_wal()) {
+          file_path = LogFileName(immutable_db_options.wal_dir,
+                                  file_meta.fd.GetNumber());
+        } else {
+          file_path = MakeTableFileName(cfd->ioptions()->cf_paths[0].path,
+                                        file_meta.fd.GetNumber());
+        }
         sfm->OnAddFile(file_path);
         if (sfm->IsMaxAllowedSpaceReached()) {
           Status new_bg_error =
@@ -231,9 +243,9 @@ Status DBImpl::FlushMemTablesToOutputFiles(
     ColumnFamilyData* cfd = arg.cfd_;
     MutableCFOptions mutable_cf_options = *cfd->GetLatestMutableCFOptions();
     SuperVersionContext* superversion_context = arg.superversion_context_;
-    Status s = FlushMemTableToOutputFile(cfd, mutable_cf_options, made_progress,
-                                         job_context, superversion_context,
-                                         log_buffer);
+    Status s = FlushMemTableToOutputFile(
+        cfd, mutable_cf_options, immutable_db_options_, made_progress,
+        job_context, superversion_context, log_buffer);
     if (!s.ok()) {
       status = s;
       if (!s.IsShutdownInProgress()) {
@@ -480,8 +492,12 @@ Status DBImpl::AtomicFlushMemTablesToOutputFiles(
                              jobs[i].GetTableProperties());
       if (sfm) {
         for (auto file_meta : jobs[i].GetFileMetas()) {
-          std::string file_path = MakeTableFileName(
-              cfds[i]->ioptions()->cf_paths[0].path, file_meta.fd.GetNumber());
+          std::string file_path =
+              file_meta.prop.is_blob_wal()
+                  ? LogFileName(immutable_db_options_.wal_dir,
+                                file_meta.fd.GetNumber())
+                  : MakeTableFileName(cfds[i]->ioptions()->cf_paths[0].path,
+                                      file_meta.fd.GetNumber());
           sfm->OnAddFile(file_path);
           if (sfm->IsMaxAllowedSpaceReached() &&
               error_handler_.GetBGError().ok()) {
@@ -599,8 +615,12 @@ void DBImpl::NotifyOnFlushCompleted(
       info.cf_name = cfd->GetName();
       // TODO(yhchiang): make db_paths dynamic in case flush does not
       //                 go to L0 in the future.
-      info.file_path = MakeTableFileName(cfd->ioptions()->cf_paths[0].path,
-                                         file_meta->fd.GetNumber());
+      info.file_path =
+          file_meta->prop.is_blob_wal()
+              ? LogFileName(immutable_db_options_.wal_dir,
+                            file_meta->fd.GetNumber())
+              : MakeTableFileName(cfd->ioptions()->cf_paths[0].path,
+                                  file_meta->fd.GetNumber());
       info.thread_id = env_->GetThreadID();
       info.job_id = job_id;
       info.triggered_writes_slowdown = triggered_writes_slowdown;
@@ -745,6 +765,24 @@ Status DBImpl::CompactRange(const CompactRangeOptions& options,
       }
       TEST_SYNC_POINT("DBImpl::RunManualCompaction()::1");
       TEST_SYNC_POINT("DBImpl::RunManualCompaction()::2");
+    }
+    while (cfd->ioptions()->enable_lazy_compaction) {
+      int bottommost_level;
+      {
+        InstrumentedMutexLock l(&mutex_);
+        bottommost_level =
+            cfd->current()->storage_info()->num_non_empty_levels() - 1;
+      }
+      if (max_level_with_files >= bottommost_level) {
+        break;
+      }
+      do {
+        ++max_level_with_files;
+        s = RunManualCompaction(cfd, max_level_with_files, max_level_with_files,
+                                options.target_path_id,
+                                options.max_subcompactions, begin, end,
+                                &files_being_compact, exclusive, false);
+      } while (max_level_with_files < bottommost_level);
     }
   }
   if (!s.ok()) {
@@ -1875,6 +1913,18 @@ void DBImpl::MaybeScheduleFlushOrCompaction() {
     env_->Schedule(&DBImpl::BGWorkCompaction, ca, Env::Priority::LOW, this,
                    &DBImpl::UnscheduleCallback);
   }
+
+  assert(bg_job_limits.max_wal_index_creations == 1);
+  while (bg_wal_index_creation_scheduled_ <
+             bg_job_limits.max_wal_index_creations &&
+         versions_->HasWalWithoutIndex()) {
+    CompactionArg* ca = new CompactionArg;
+    ca->db = this;
+    ca->prepicked_compaction = nullptr;
+    bg_wal_index_creation_scheduled_++;
+    env_->Schedule(&DBImpl::BGWorkCreateWalIndex, ca, Env::Priority::LOW, this,
+                   &DBImpl::UnscheduleCallback);
+  }
 }
 
 DBImpl::BGJobLimits DBImpl::GetBGJobLimits() const {
@@ -1917,6 +1967,7 @@ DBImpl::BGJobLimits DBImpl::GetBGJobLimits(
     // throttle background compactions until we deem necessary
     res.max_compactions = 1;
   }
+  res.max_wal_index_creations = 1;
   return res;
 }
 
@@ -1961,16 +2012,30 @@ ColumnFamilyData* DBImpl::PopFirstFromCompactionQueue() {
 void DBImpl::AddToGarbageCollectionQueue(ColumnFamilyData* cfd) {
   assert(!cfd->queued_for_garbage_collection());
   cfd->Ref();
-  garbage_collection_queue_.push_back(cfd);
+  garbage_collection_queue_.emplace_back(cfd);
   cfd->set_queued_for_garbage_collection(true);
 }
 
 ColumnFamilyData* DBImpl::PopFirstFromGarbageCollectionQueue() {
   assert(!garbage_collection_queue_.empty());
+
+  int max_check = std::min(int(garbage_collection_queue_.size()),
+                           GetBGJobLimits().max_garbage_collections);
+  assert(max_check > 0);
+  std::nth_element(
+      garbage_collection_queue_.begin(),
+      garbage_collection_queue_.begin() + max_check,
+      garbage_collection_queue_.end(),
+      [](ColumnFamilyData* left, ColumnFamilyData* right) {
+        return left->current()->storage_info()->total_garbage_ratio() >
+               right->current()->storage_info()->total_garbage_ratio();
+      });
+
   auto max_iter = garbage_collection_queue_.begin();
   double max_load = (*max_iter)->current()->GetGarbageCollectionLoad();
-  for (auto it = std::next(max_iter); it != garbage_collection_queue_.end();
-       ++it) {
+  for (auto it = std::next(max_iter),
+            end = garbage_collection_queue_.begin() + max_check;
+       it != end; ++it) {
     double tmp_load = (*it)->current()->GetGarbageCollectionLoad();
     if (max_load < tmp_load) {
       max_load = tmp_load;
@@ -2016,8 +2081,12 @@ void DBImpl::SchedulePendingCompaction(ColumnFamilyData* cfd) {
   }
 }
 
-void DBImpl::SchedulePendingGarbageCollection(ColumnFamilyData* cfd) {
-  if (!cfd->queued_for_garbage_collection() && cfd->NeedsGarbageCollection()) {
+void DBImpl::SchedulePendingGarbageCollection() {
+  for (auto cfd : *versions_->GetColumnFamilySet()) {
+    if (cfd->IsDropped() || cfd->queued_for_garbage_collection() ||
+        !cfd->NeedsGarbageCollection()) {
+      continue;
+    }
     AddToGarbageCollectionQueue(cfd);
     ++unscheduled_garbage_collections_;
   }
@@ -2081,6 +2150,15 @@ void DBImpl::BGWorkPurge(void* db) {
   TEST_SYNC_POINT("DBImpl::BGWorkPurge:end");
 }
 
+void DBImpl::BGWorkCreateWalIndex(void* arg) {
+  CompactionArg ca = *(reinterpret_cast<CompactionArg*>(arg));
+  delete reinterpret_cast<CompactionArg*>(arg);
+  IOSTATS_SET_THREAD_POOL_ID(Env::Priority::HIGH);
+  TEST_SYNC_POINT("DBImpl::BGWorkCreateWalIndex:start");
+  reinterpret_cast<DBImpl*>(ca.db)->BackgroundCallWalIndexCreation();
+  TEST_SYNC_POINT("DBImpl::BGWorkCreateWalIndex:end");
+}
+
 void DBImpl::UnscheduleCallback(void* arg) {
   CompactionArg ca = *(reinterpret_cast<CompactionArg*>(arg));
   delete reinterpret_cast<CompactionArg*>(arg);
@@ -2125,6 +2203,8 @@ Status DBImpl::BackgroundFlush(bool* made_progress, JobContext* job_context,
     for (const auto& iter : flush_req) {
       ColumnFamilyData* cfd = iter.first;
       if (cfd->IsDropped() || !cfd->imm()->IsFlushPending()) {
+        // TODO fix myrocks db_proprioty_test
+        // cfd->dec_queued_for_flush();
         // can't flush this CF, try next one
         cfd->dec_queued_for_flush();
         if (cfd->Unref()) {
@@ -2468,6 +2548,39 @@ void DBImpl::BackgroundCallGarbageCollection() {
     // that case, all DB variables will be dealloacated and referencing them
     // will cause trouble.
   }
+}
+
+void DBImpl::BackgroundCallWalIndexCreation() {
+  JobContext job_context(next_job_id_.fetch_add(1), true);
+  TEST_SYNC_POINT("BackgroundCallWalIndexCreation:0");
+  LogBuffer log_buffer(InfoLogLevel::INFO_LEVEL,
+                       immutable_db_options_.info_log.get());
+  InstrumentedMutexLock l(&mutex_);
+  num_running_wal_index_creations_++;
+
+  assert(bg_wal_index_creation_scheduled_);
+  Status s = BackgroundWalIndexCreation(&job_context, &log_buffer);
+  TEST_SYNC_POINT("BackgroundWalIndexCreation:1");
+  if (!s.ok() && !s.IsShutdownInProgress()) {
+    mutex_.Unlock();
+    uint64_t error_cnt =
+        default_cf_internal_stats_->BumpAndGetBackgroundErrorCount();
+    log_buffer.FlushBufferToLog();
+    ROCKS_LOG_ERROR(immutable_db_options_.info_log,
+                    "Waiting after background wal index creation error: %s, "
+                    "Accumulated background error counts: %" PRIu64,
+                    s.ToString().c_str(), error_cnt);
+    LogFlush(immutable_db_options_.info_log);
+    env_->SleepForMicroseconds(1000000);
+    mutex_.Lock();
+  }
+
+  assert(num_running_wal_index_creations_ > 0);
+  num_running_wal_index_creations_--;
+  bg_wal_index_creation_scheduled_--;
+
+  // See if there's more work to be done
+  MaybeScheduleFlushOrCompaction();
 }
 
 Status DBImpl::BackgroundCompaction(bool* made_progress,
@@ -2966,7 +3079,8 @@ Status DBImpl::BackgroundGarbageCollection(bool* made_progress,
       // until we make a copy in the following code
       TEST_SYNC_POINT(
           "DBImpl::BackgroundGarbageCollection():BeforePickGarbageCollection");
-      c.reset(cfd->PickGarbageCollection(*mutable_cf_options, log_buffer));
+      c.reset(cfd->PickGarbageCollection(MinLogNumberToKeep(),
+                                         *mutable_cf_options, log_buffer));
       TEST_SYNC_POINT(
           "DBImpl::BackgroundGarbageCollection():AfterPickGarbageCollection");
 
@@ -3079,6 +3193,68 @@ Status DBImpl::BackgroundGarbageCollection(bool* made_progress,
   c.reset();
 
   TEST_SYNC_POINT("DBImpl::BackgroundGarbageCollection:Finish");
+  return status;
+}
+
+Status DBImpl::BackgroundWalIndexCreation(JobContext* job_context,
+                                          LogBuffer* log_buffer) {
+  TEST_SYNC_POINT("DBImpl::BackgroundWalIndexCreation:Start");
+
+  Status status;
+  if (!error_handler_.IsBGWorkStopped()) {
+    if (shutting_down_.load(std::memory_order_acquire)) {
+      status = Status::ShutdownInProgress();
+    }
+  } else {
+    status = error_handler_.GetBGError();
+  }
+
+  if (!status.ok()) {
+    return status;
+  }
+
+  // 1. Pick Wal files from ColumnFamilySet, Need mutex lock
+  mutex_.AssertHeld();
+  TEST_SYNC_POINT("DBImpl::BackgroundWalIndexCreation:PickWalFiles");
+  std::vector<FileMetaData*> picked_wals;
+  if (versions_->PickBlobWalWithoutIndex(&picked_wals, &mutex_)) {
+    // 2. CreateWalIndex respectively, NO LOCK
+    mutex_.Unlock();
+    TEST_SYNC_POINT("DBImpl::BackgroundWalIndexCreation:CreateIndexes");
+    std::unordered_set<uint64_t> failed_wal;
+    for (auto& f : picked_wals) {
+      ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                     "%d WalIndexCreation Started", f->fd.GetNumber());
+      Status s = CreateWalIndex(f->fd.GetNumber());
+      if (UNLIKELY(!s.ok())) {
+        failed_wal.insert(f->fd.GetNumber());
+        ROCKS_LOG_WARN(immutable_db_options_.info_log,
+                       "%d WalIndexCreation Fail: %s", f->fd.GetNumber(),
+                       s.ToString().c_str());
+        auto idx_fname =
+            LogIndexFileName(immutable_db_options_.wal_dir, f->fd.GetNumber());
+        auto tmp_idx_fname = idx_fname + ".tmp";
+        immutable_db_options_.env->DeleteFile(tmp_idx_fname);
+        // clear mess of failed wals clear tmp index, and remove it from
+        // index_creating_ongoing_wals
+        continue;
+      }
+      ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                     "%d WalIndexCreation Success", f->fd.GetNumber());
+    }
+
+    // 3. broadcast wal gc_status
+    TEST_SYNC_POINT("DBImpl::BackgroundWalIndexCreation:BroadcastGcstatus");
+    for (auto& f : picked_wals) {
+      if (failed_wal.find(f->fd.GetNumber()) != failed_wal.end()) {
+        continue;
+      }
+      f->gc_status = FileMetaData::kGarbageCollectionPermitted;
+    }
+    mutex_.Lock();
+  }
+
+  TEST_SYNC_POINT("DBImpl::BackgroundWalIndexCreation:Finish");
   return status;
 }
 
@@ -3211,7 +3387,7 @@ void DBImpl::InstallSuperVersionAndScheduleWork(
   // Whenever we install new SuperVersion, we might need to issue new flushes or
   // compactions.
   SchedulePendingCompaction(cfd);
-  SchedulePendingGarbageCollection(cfd);
+  SchedulePendingGarbageCollection();
   MaybeScheduleFlushOrCompaction();
 
   // Update max_total_in_memory_state_

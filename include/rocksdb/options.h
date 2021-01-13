@@ -810,6 +810,8 @@ struct DBOptions {
   // Dynamically changeable through SetDBOptions() API.
   size_t writable_file_max_buffer_size = 1024 * 1024;
 
+  size_t blob_cache_size = 32768;
+
   // Use adaptive mutex, which spins in the user space before resorting
   // to kernel. This could reduce context switch when the mutex is not
   // heavily contended. However, if the mutex is hot, we could end up
@@ -943,6 +945,10 @@ struct DBOptions {
   // Default: nullptr (disabled)
   // Not supported in ROCKSDB_LITE mode!
   std::shared_ptr<Cache> row_cache = nullptr;
+
+  // A global cache for blob in wal which is shared across CF.
+  // Default: nullptr (disabled)
+  std::shared_ptr<Cache> blob_cache = nullptr;
 
   std::shared_ptr<MetricsReporterFactory> metrics_reporter_factory = nullptr;
 
@@ -1263,12 +1269,16 @@ struct WriteOptions {
   // Default: false
   bool low_pri;
 
+  // Default: false, disable KV separation
+  bool enable_kv_separate;
+
   WriteOptions()
       : sync(false),
         disableWAL(false),
         ignore_missing_column_families(false),
         no_slowdown(false),
-        low_pri(false) {}
+        low_pri(false),
+        enable_kv_separate(false) {}
 };
 
 // Options that control flush operations

@@ -919,7 +919,7 @@ TEST_F(CompactionIteratorWithSnapshotCheckerTest,
 }
 
 // Compaction filter should keep uncommitted key as-is, and
-//   * Convert the latest velue to deletion, and/or
+//   * Convert the latest value to deletion, and/or
 //   * if latest value is a merge, apply filter to all suequent merges.
 
 TEST_F(CompactionIteratorWithSnapshotCheckerTest, CompactionFilter_Value) {

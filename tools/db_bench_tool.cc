@@ -961,6 +961,7 @@ DEFINE_uint64(wal_size_limit_MB, 0,
               " in MB.");
 DEFINE_uint64(max_wal_size, 0, "Set total max WAL size");
 DEFINE_uint64(max_total_wal_size, 0, "Set total max WAL size");
+DEFINE_bool(enable_kv_seperate, false, "Key Value Separate in Write");
 
 DEFINE_bool(mmap_read, true, "Allow reads to occur via mmap-ing files");
 
@@ -2534,6 +2535,9 @@ class Benchmark {
       read_random_exp_range_ = FLAGS_read_random_exp_range;
       if (FLAGS_sync) {
         write_options_.sync = true;
+      }
+      if (FLAGS_enable_kv_seperate) {
+        write_options_.enable_kv_separate = true;
       }
       write_options_.disableWAL = FLAGS_disable_wal;
 

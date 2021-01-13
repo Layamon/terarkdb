@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "db/column_family.h"
+#include "db/compaction_picker.h"
 #include "db/version_set.h"
 #include "rocksdb/compaction_filter.h"
 #include "util/string_util.h"
@@ -432,8 +433,13 @@ int InputSummary(const std::vector<FileMetaData*>& files, char* output,
     int ret;
     char sztxt[16];
     AppendHumanBytes(files.at(i)->fd.GetFileSize(), sztxt, 16);
-    ret = snprintf(output + write, sz, "%" PRIu64 "(%s) ",
-                   files.at(i)->fd.GetNumber(), sztxt);
+    if (files.at(i)->prop.is_blob_wal()) {
+      ret = snprintf(output + write, sz, "%" PRIu64 "(%s,wal) ",
+                     files.at(i)->fd.GetNumber(), sztxt);
+    } else {
+      ret = snprintf(output + write, sz, "%" PRIu64 "(%s,sst) ",
+                     files.at(i)->fd.GetNumber(), sztxt);
+    }
     if (ret < 0 || ret >= sz) break;
     write += ret;
   }

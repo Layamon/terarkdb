@@ -456,7 +456,6 @@ class DBImpl : public DB {
   Status TEST_GetLatestMutableCFOptions(ColumnFamilyHandle* column_family,
                                         MutableCFOptions* mutable_cf_options);
 
-  Cache* TEST_table_cache() { return table_cache_.get(); }
 
   WriteController& TEST_write_controler() { return write_controller_; }
 
@@ -472,11 +471,13 @@ class DBImpl : public DB {
   void TEST_WaitForTimedTaskRun(std::function<void()> callback) const;
 
 #endif  // NDEBUG
+  Cache* TEST_table_cache() { return table_cache_.get(); }
 
   struct BGJobLimits {
     int max_flushes;
     int max_compactions;
     int max_garbage_collections;
+    int max_wal_index_creations;
   };
   // Returns maximum background flushes and compactions allowed to be scheduled
   BGJobLimits GetBGJobLimits() const;
@@ -935,11 +936,11 @@ class DBImpl : public DB {
   // Flush the in-memory write buffer to storage.  Switches to a new
   // log-file/memtable and writes a new descriptor iff successful. Then
   // installs a new super version for the column family.
-  Status FlushMemTableToOutputFile(ColumnFamilyData* cfd,
-                                   const MutableCFOptions& mutable_cf_options,
-                                   bool* madeProgress, JobContext* job_context,
-                                   SuperVersionContext* superversion_context,
-                                   LogBuffer* log_buffer);
+  Status FlushMemTableToOutputFile(
+      ColumnFamilyData* cfd, const MutableCFOptions& mutable_cf_options,
+      const ImmutableDBOptions& immutable_db_options, bool* madeProgress,
+      JobContext* job_context, SuperVersionContext* superversion_context,
+      LogBuffer* log_buffer);
 
   // Argument required by background flush thread.
   struct BGFlushArg {
@@ -1057,17 +1058,21 @@ class DBImpl : public DB {
                          WriteBatch* tmp_batch, size_t* write_with_wal,
                          WriteBatch** to_be_cached_state);
 
+  void UnpackBatch(const WriteThread::WriteGroup& write_group,
+                   const WriteBatch* merged_batch, bool wal_only = true);
+
   Status WriteToWAL(const WriteBatch& merged_batch, log::Writer* log_writer,
-                    uint64_t* log_used, uint64_t* log_size);
+                    uint64_t* log_used, uint64_t* log_size,
+                    WriteThread::Writer& w);
 
   Status WriteToWAL(const WriteThread::WriteGroup& write_group,
                     log::Writer* log_writer, uint64_t* log_used,
                     bool need_log_sync, bool need_log_dir_sync,
-                    SequenceNumber sequence);
+                    SequenceNumber sequence, WriteThread::Writer& w);
 
   Status ConcurrentWriteToWAL(const WriteThread::WriteGroup& write_group,
                               uint64_t* log_used, SequenceNumber* last_sequence,
-                              size_t seq_inc);
+                              size_t seq_inc, WriteThread::Writer& w);
 
   // Used by WriteImpl to update bg_error_ if paranoid check is enabled.
   void WriteStatusCheck(const Status& status);
@@ -1112,10 +1117,12 @@ class DBImpl : public DB {
   void SchedulePendingFlush(const FlushRequest& req, FlushReason flush_reason);
 
   void SchedulePendingCompaction(ColumnFamilyData* cfd);
-  void SchedulePendingGarbageCollection(ColumnFamilyData* cfd);
+  void SchedulePendingGarbageCollection();
   void SchedulePendingPurge(const std::string& fname,
                             const std::string& dir_to_sync, FileType type,
                             uint64_t number, int job_id);
+  void SchedulePendingWalIndexCreation(uint64_t);
+
   static void BGWorkCompaction(void* arg);
   static void BGWorkGarbageCollection(void* arg);
   // Runs a pre-chosen universal compaction involving bottom level in a
@@ -1123,18 +1130,24 @@ class DBImpl : public DB {
   static void BGWorkBottomCompaction(void* arg);
   static void BGWorkFlush(void* db);
   static void BGWorkPurge(void* arg);
+  static void BGWorkCreateWalIndex(void* arg);
+
   static void UnscheduleCallback(void* arg);
   void BackgroundCallCompaction(PrepickedCompaction* prepicked_compaction,
                                 Env::Priority bg_thread_pri);
   void BackgroundCallGarbageCollection();
   void BackgroundCallFlush();
   void BackgroundCallPurge();
+  void BackgroundCallWalIndexCreation();
+
   Status BackgroundCompaction(bool* madeProgress, JobContext* job_context,
                               LogBuffer* log_buffer,
                               PrepickedCompaction* prepicked_compaction);
   Status BackgroundGarbageCollection(bool* madeProgress,
                                      JobContext* job_context,
                                      LogBuffer* log_buffer);
+  Status BackgroundWalIndexCreation(JobContext* job_context,
+                                    LogBuffer* log_buffer);
   Status BackgroundFlush(bool* madeProgress, JobContext* job_context,
                          LogBuffer* log_buffer, FlushReason* reason);
 
@@ -1417,7 +1430,8 @@ class DBImpl : public DB {
   // invariant(column family present in compaction_queue_ <==>
   // ColumnFamilyData::pending_compaction_ == true)
   std::deque<ColumnFamilyData*> compaction_queue_;
-  std::deque<ColumnFamilyData*> garbage_collection_queue_;
+  //
+  std::vector<ColumnFamilyData*> garbage_collection_queue_;
 
   // A queue to store filenames of the files to be purged
   std::deque<PurgeFileInfo> purge_queue_;
@@ -1451,11 +1465,18 @@ class DBImpl : public DB {
   // scheduled
   int bg_garbage_collection_scheduled_;
 
+  // count how many background wal index creation are running or have been
+  // scheduled
+  int bg_wal_index_creation_scheduled_;
+
   // stores the number of compactions are currently running
   int num_running_compactions_;
 
   // stores the number of garbage collections are currently running
   int num_running_garbage_collections_;
+
+  // stores the number of wal index creation are currently running
+  int num_running_wal_index_creations_;
 
   // number of background memtable flush jobs, submitted to the HIGH pool
   int bg_flush_scheduled_;
@@ -1557,6 +1578,7 @@ class DBImpl : public DB {
 
 #ifndef ROCKSDB_LITE
   WalManager wal_manager_;
+  std::atomic<bool> index_creating_;
 #endif  // ROCKSDB_LITE
 
   // Unified interface for logging events
@@ -1629,6 +1651,9 @@ class DBImpl : public DB {
   bool MCOverlap(ManualCompactionState* m, ManualCompactionState* m1);
 
   size_t GetWalPreallocateBlockSize(uint64_t write_buffer_size) const;
+
+  Status CreateWalIndex(uint64_t log_file_no);
+
   Env::WriteLifeTimeHint CalculateWALWriteHint() { return Env::WLTH_SHORT; }
 
   // When set, we use a separate queue for writes that dont write to memtable.

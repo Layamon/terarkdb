@@ -9,11 +9,13 @@
 
 #pragma once
 #include <vector>
+
 #include "db/write_thread.h"
-#include "rocksdb/types.h"
-#include "rocksdb/write_batch.h"
 #include "rocksdb/db.h"
 #include "rocksdb/options.h"
+#include "rocksdb/types.h"
+#include "rocksdb/write_batch.h"
+#include "terark/util/crc.hpp"
 #include "util/autovector.h"
 
 namespace rocksdb {
@@ -21,6 +23,7 @@ namespace rocksdb {
 class MemTable;
 class FlushScheduler;
 class ColumnFamilyData;
+class ColumnFamilySet;
 
 class ColumnFamilyMemTables {
  public:
@@ -63,7 +66,6 @@ class ColumnFamilyMemTablesDefault : public ColumnFamilyMemTables {
 // WriteBatch that we don't want in the public WriteBatch interface.
 class WriteBatchInternal {
  public:
-
   // WriteBatch header has an 8-byte sequence number followed by a 4-byte count.
   static const size_t kHeader = 12;
 
@@ -126,13 +128,9 @@ class WriteBatchInternal {
   // This offset is only valid if the batch is not empty.
   static size_t GetFirstOffset(WriteBatch* batch);
 
-  static Slice Contents(const WriteBatch* batch) {
-    return Slice(batch->rep_);
-  }
+  static Slice Contents(const WriteBatch* batch) { return Slice(batch->rep_); }
 
-  static size_t ByteSize(const WriteBatch* batch) {
-    return batch->rep_.size();
-  }
+  static size_t ByteSize(const WriteBatch* batch) { return batch->rep_.size(); }
 
   static Status SetContents(WriteBatch* batch, const Slice& contents);
 
@@ -159,6 +157,7 @@ class WriteBatchInternal {
   static Status InsertInto(
       WriteThread::WriteGroup& write_group, SequenceNumber sequence,
       ColumnFamilyMemTables* memtables, FlushScheduler* flush_scheduler,
+      bool enable_kv_separate = false,
       bool ignore_missing_column_families = false, uint64_t log_number = 0,
       DB* db = nullptr, bool concurrent_memtable_writes = false,
       bool seq_per_batch = false, bool batch_per_txn = true);
@@ -167,15 +166,18 @@ class WriteBatchInternal {
   // next_seq returns the seq after last sequence number used in MemTable insert
   static Status InsertInto(
       const WriteBatch* batch, ColumnFamilyMemTables* memtables,
-      FlushScheduler* flush_scheduler,
+      FlushScheduler* flush_scheduler, bool enable_kv_separate = false,
       bool ignore_missing_column_families = false, uint64_t log_number = 0,
       DB* db = nullptr, bool concurrent_memtable_writes = false,
       SequenceNumber* next_seq = nullptr, bool* has_valid_writes = nullptr,
-      bool seq_per_batch = false, bool batch_per_txn = true);
+      bool seq_per_batch = false, bool batch_per_txn = true,
+      size_t batch_content_wal_offset = (uint64_t)-1,
+      size_t wal_header_size = log::kHeaderSize);
 
   static Status InsertInto(WriteThread::Writer* writer, SequenceNumber sequence,
                            ColumnFamilyMemTables* memtables,
                            FlushScheduler* flush_scheduler,
+                           bool enable_kv_separate = false,
                            bool ignore_missing_column_families = false,
                            uint64_t log_number = 0, DB* db = nullptr,
                            bool concurrent_memtable_writes = false,
@@ -193,6 +195,18 @@ class WriteBatchInternal {
   // state meant to be used only during recovery.
   static void SetAsLastestPersistentState(WriteBatch* b);
   static bool IsLatestPersistentState(const WriteBatch* b);
+  static Status SeparateCFData(
+      const WriteBatch* batch, Arena* arena,
+      uint64_t batch_content_physical_offset, uint64_t wal_header_size,
+      std::map<uint32_t, std::vector<std::pair<ParsedInternalKey, WalEntry>>>*
+          wal_entry_map,
+      const ColumnFamilySet* cfs,
+      bool seq_per_batch
+#ifndef NDEBUG
+      ,
+      std::unique_ptr<RandomAccessFileReader>& rd_file_reader
+#endif
+  );
 };
 
 // LocalSavePoint is similar to a scope guard

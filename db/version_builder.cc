@@ -358,6 +358,9 @@ class VersionBuilder::Rep {
             case FileMetaData::kGarbageCollectionPermitted:
               assert(item.gc_forbidden_version != dependence_version_);
               break;
+            case FileMetaData::kGarbageCollectionDefered:
+              assert(item.f->prop.is_blob_wal());
+              break;
           }
           item.f->num_antiquation = num_antiquation;
         }
@@ -373,6 +376,9 @@ class VersionBuilder::Rep {
 
   void CheckDependence(VersionStorageInfo* vstorage, FileMetaData* f,
                        bool is_map) {
+    // there are 2 kind of file may have dependence
+    // 1. map sst depend hiden sst
+    // 2. key sst depend blob sst/wal
     for (auto& dependence : f->prop.dependence) {
       auto item = TransFileNumber(dependence.file_number);
       if (item == nullptr) {
@@ -380,6 +386,7 @@ class VersionBuilder::Rep {
         abort();
       }
       if (is_map && !item->f->prop.dependence.empty()) {
+        // hiden sst of a map sst also depend others, check recursively
         CheckDependence(vstorage, item->f, item->f->prop.is_map_sst());
       }
     }
@@ -573,6 +580,8 @@ class VersionBuilder::Rep {
         FileMetaData* f = new FileMetaData(pair.second);
         assert(f->table_reader_handle == nullptr);
         assert(level < 0 || levels_[level].count(f->fd.GetNumber()) == 0);
+        assert(!f->prop.is_blob_wal() ||
+               (f->prop.is_blob_wal() && level == -1));  // all blob wal in -1
         PutSst(f, level);
       } else {
         uint64_t number = pair.second.fd.GetNumber();
@@ -721,10 +730,10 @@ class VersionBuilder::Rep {
         auto file_read_hist =
             level >= 0 ? internal_stats->GetFileReadHist(level) : nullptr;
         table_cache_->FindTable(
-            env_options_, *base_vstorage_->InternalComparator(), file_meta->fd,
-            &file_meta->table_reader_handle, prefix_extractor, false /*no_io */,
-            true /* record_read_stats */, file_read_hist, false, level,
-            prefetch_index_and_filter_in_cache, file_meta->prop.is_map_sst());
+            env_options_, file_meta->fd, &file_meta->table_reader_handle,
+            prefix_extractor, false /*no_io */, true /* record_read_stats */,
+            file_read_hist, false, level, prefetch_index_and_filter_in_cache,
+            file_meta->prop.is_map_sst());
         if (file_meta->table_reader_handle != nullptr) {
           // Load table_reader
           file_meta->fd.table_reader = table_cache_->GetTableReaderFromHandle(
@@ -767,9 +776,9 @@ class VersionBuilder::Rep {
         auto* file_meta = files_meta[file_idx];
         std::shared_ptr<const TableProperties> properties;
 
-        auto s = table_cache_->GetTableProperties(
-            env_options_, *base_vstorage_->InternalComparator(), *file_meta,
-            &properties, prefix_extractor, false /*no_io */);
+        auto s = table_cache_->GetTableProperties(env_options_, *file_meta,
+                                                  &properties, prefix_extractor,
+                                                  false /*no_io */);
 
         if (s.ok() && properties) {
           file_meta->prop.num_entries = properties->num_entries;

@@ -9,7 +9,9 @@
 
 #include "db/table_cache.h"
 
+#include "db/column_family.h"
 #include "db/dbformat.h"
+#include "db/log_writer.h"
 #include "db/range_tombstone_fragmenter.h"
 #include "db/version_edit.h"
 #include "monitoring/perf_context_imp.h"
@@ -20,6 +22,7 @@
 #include "table/table_builder.h"
 #include "table/table_reader.h"
 #include "table/two_level_iterator.h"
+#include "table_cache.h"
 #include "util/c_style_callback.h"
 #include "util/coding.h"
 #include "util/file_reader_writer.h"
@@ -61,7 +64,6 @@ class LazyCreateIterator : public Snapshot {
   ReadOptions options_;  // deep copy
   SequenceNumber snapshot_;
   const EnvOptions& env_options_;
-  const InternalKeyComparator& icomparator_;
   RangeDelAggregator* range_del_agg_;
   const SliceTransform* prefix_extractor_;
   bool for_compaction_;
@@ -71,7 +73,6 @@ class LazyCreateIterator : public Snapshot {
  public:
   LazyCreateIterator(TableCache* table_cache, const ReadOptions& options,
                      const EnvOptions& env_options,
-                     const InternalKeyComparator& icomparator,
                      RangeDelAggregator* range_del_agg,
                      const SliceTransform* prefix_extractor,
                      bool for_compaction, bool skip_filters,
@@ -80,7 +81,6 @@ class LazyCreateIterator : public Snapshot {
         options_(options),
         snapshot_(0),
         env_options_(env_options),
-        icomparator_(icomparator),
         range_del_agg_(range_del_agg),
         prefix_extractor_(prefix_extractor),
         for_compaction_(for_compaction),
@@ -102,17 +102,20 @@ class LazyCreateIterator : public Snapshot {
                                const DependenceMap& _dependence_map,
                                Arena* _arena, TableReader** _reader_ptr) {
     return table_cache_->NewIterator(
-        options_, env_options_, icomparator_, *_f, _dependence_map,
-        range_del_agg_, prefix_extractor_, _reader_ptr, nullptr,
-        for_compaction_, _arena, skip_filters_, level_);
+        options_, env_options_, *_f, _dependence_map, range_del_agg_,
+        prefix_extractor_, _reader_ptr, nullptr, for_compaction_, _arena,
+        skip_filters_, level_);
   }
 };
 
 }  // namespace
 
-TableCache::TableCache(const ImmutableCFOptions& ioptions,
+TableCache::TableCache(uint32_t cf_id, const ImmutableCFOptions& ioptions,
+                       const ImmutableDBOptions& db_options,
                        const EnvOptions& env_options, Cache* const cache)
-    : ioptions_(ioptions),
+    : cf_id_(cf_id),
+      ioptions_(ioptions),
+      idb_options_(db_options),
       env_options_(env_options),
       cache_(cache),
       immortal_tables_(false) {
@@ -134,42 +137,13 @@ void TableCache::ReleaseHandle(Cache::Handle* handle) {
 }
 
 Status TableCache::GetTableReader(
-    const EnvOptions& env_options,
-    const InternalKeyComparator& internal_comparator, const FileDescriptor& fd,
+    const EnvOptions& env_options, const FileDescriptor& fd,
     bool sequential_mode, size_t readahead, bool record_read_stats,
     HistogramImpl* file_read_hist, std::unique_ptr<TableReader>* table_reader,
     const SliceTransform* prefix_extractor, bool skip_filters, int level,
     bool prefetch_index_and_filter_in_cache, bool for_compaction,
     bool force_memory) {
-  auto s = GetTableReaderImpl(
-      env_options, internal_comparator, fd, sequential_mode, readahead,
-      record_read_stats, file_read_hist, table_reader, prefix_extractor,
-      skip_filters, level, prefetch_index_and_filter_in_cache, for_compaction,
-      force_memory);
-  if (s.IsInvalidArgument() && s.subcode() == Status::kRequireMmap) {
-    // this table requires mmap open, make it happy
-    assert(!env_options.use_mmap_reads);
-    EnvOptions mmap_env_options = env_options;
-    mmap_env_options.use_mmap_reads = true;
-    mmap_env_options.use_direct_reads = false;
-    mmap_env_options.use_aio_reads = false;
-    s = GetTableReaderImpl(
-        mmap_env_options, internal_comparator, fd, sequential_mode, readahead,
-        record_read_stats, file_read_hist, table_reader, prefix_extractor,
-        skip_filters, level, prefetch_index_and_filter_in_cache, for_compaction,
-        force_memory);
-  }
-  return s;
-}
 
-Status TableCache::GetTableReaderImpl(
-    const EnvOptions& env_options,
-    const InternalKeyComparator& internal_comparator, const FileDescriptor& fd,
-    bool sequential_mode, size_t readahead, bool record_read_stats,
-    HistogramImpl* file_read_hist, std::unique_ptr<TableReader>* table_reader,
-    const SliceTransform* prefix_extractor, bool skip_filters, int level,
-    bool prefetch_index_and_filter_in_cache, bool for_compaction,
-    bool force_memory) {
   std::string fname =
       TableFileName(ioptions_.cf_paths, fd.GetNumber(), fd.GetPathId());
   std::unique_ptr<RandomAccessFile> file;
@@ -198,8 +172,9 @@ Status TableCache::GetTableReaderImpl(
             ioptions_.listeners));
     s = ioptions_.table_factory->NewTableReader(
         TableReaderOptions(ioptions_, prefix_extractor, env_options,
-                           internal_comparator, skip_filters, immortal_tables_,
-                           level, fd.GetNumber(), fd.largest_seqno),
+                           ioptions_.internal_comparator, skip_filters,
+                           immortal_tables_, level, fd.GetNumber(),
+                           fd.largest_seqno),
         std::move(file_reader), fd.GetFileSize(), table_reader,
         prefetch_index_and_filter_in_cache);
     TEST_SYNC_POINT("TableCache::GetTableReader:0");
@@ -215,13 +190,12 @@ void TableCache::EraseHandle(const FileDescriptor& fd, Cache::Handle* handle) {
 }
 
 Status TableCache::FindTable(const EnvOptions& env_options,
-                             const InternalKeyComparator& internal_comparator,
                              const FileDescriptor& fd, Cache::Handle** handle,
                              const SliceTransform* prefix_extractor,
                              const bool no_io, bool record_read_stats,
                              HistogramImpl* file_read_hist, bool skip_filters,
                              int level, bool prefetch_index_and_filter_in_cache,
-                             bool force_memory) {
+                             bool force_memory, bool is_wal) {
   PERF_TIMER_GUARD(find_table_nanos);
   Status s;
   uint64_t number = fd.GetNumber();
@@ -234,13 +208,26 @@ Status TableCache::FindTable(const EnvOptions& env_options,
     if (no_io) {  // Don't do IO and return a not-found status
       return Status::Incomplete("Table not found in table_cache, no_io is set");
     }
+
     std::unique_ptr<TableReader> table_reader;
-    s = GetTableReader(env_options, internal_comparator, fd,
-                       false /* sequential mode */, 0 /* readahead */,
-                       record_read_stats, file_read_hist, &table_reader,
-                       prefix_extractor, skip_filters, level,
-                       prefetch_index_and_filter_in_cache,
-                       false /* for_compaction */, force_memory);
+    if (is_wal) {
+      std::string file_name = LogFileName(idb_options_.wal_dir, number);
+
+      std::unique_ptr<RandomAccessFile> file;
+      EnvOptions env_opt_for_wal;
+      assert(!env_opt_for_wal.use_mmap_reads);
+      s = ioptions_.env->NewRandomAccessFile(file_name, &file, env_opt_for_wal);
+      if (s.ok()) {
+        table_reader.reset(new log::WalBlobReader(std::move(file), number,
+                                                  idb_options_, env_options));
+      }
+    } else {
+      s = GetTableReader(env_options, fd, false /* sequential mode */,
+                         0 /* readahead */, record_read_stats, file_read_hist,
+                         &table_reader, prefix_extractor, skip_filters, level,
+                         prefetch_index_and_filter_in_cache,
+                         false /* for_compaction */, force_memory);
+    }
     if (!s.ok()) {
       assert(table_reader == nullptr);
       RecordTick(ioptions_.statistics, NO_FILE_ERRORS);
@@ -261,11 +248,10 @@ Status TableCache::FindTable(const EnvOptions& env_options,
 
 InternalIterator* TableCache::NewIterator(
     const ReadOptions& options, const EnvOptions& env_options,
-    const InternalKeyComparator& icomparator, const FileMetaData& file_meta,
-    const DependenceMap& dependence_map, RangeDelAggregator* range_del_agg,
-    const SliceTransform* prefix_extractor, TableReader** table_reader_ptr,
-    HistogramImpl* file_read_hist, bool for_compaction, Arena* arena,
-    bool skip_filters, int level) {
+    const FileMetaData& file_meta, const DependenceMap& dependence_map,
+    RangeDelAggregator* range_del_agg, const SliceTransform* prefix_extractor,
+    TableReader** table_reader_ptr, HistogramImpl* file_read_hist,
+    bool for_compaction, Arena* arena, bool skip_filters, int level) {
   PERF_TIMER_GUARD(new_table_iterator_nanos);
 
   Status s;
@@ -277,10 +263,12 @@ InternalIterator* TableCache::NewIterator(
   }
   size_t readahead = 0;
   bool record_stats = !for_compaction;
-  if (file_meta.prop.is_map_sst()) {
+  if (file_meta.prop.is_map_sst() || file_meta.prop.is_blob_wal()) {
     record_stats = false;
   } else {
-    // MapSST don't handle these
+    // these code is an optimization for seq-read to change random read to
+    // sequential read, such as compaction and readahead
+    // MapSST and blob-wal don't handle these
     if (for_compaction) {
 #ifndef NDEBUG
       bool use_direct_reads_for_compaction = env_options.use_direct_reads;
@@ -302,10 +290,9 @@ InternalIterator* TableCache::NewIterator(
   auto& fd = file_meta.fd;
   if (create_new_table_reader) {
     std::unique_ptr<TableReader> table_reader_unique_ptr;
-    s = GetTableReader(env_options, icomparator, fd, true /* sequential_mode */,
-                       readahead, record_stats, nullptr,
-                       &table_reader_unique_ptr, prefix_extractor,
-                       false /* skip_filters */, level,
+    s = GetTableReader(env_options, fd, true /* sequential_mode */, readahead,
+                       record_stats, nullptr, &table_reader_unique_ptr,
+                       prefix_extractor, false /* skip_filters */, level,
                        true /* prefetch_index_and_filter_in_cache */,
                        for_compaction, file_meta.prop.is_map_sst());
     if (s.ok()) {
@@ -314,11 +301,11 @@ InternalIterator* TableCache::NewIterator(
   } else {
     table_reader = fd.table_reader;
     if (table_reader == nullptr) {
-      s = FindTable(env_options, icomparator, fd, &handle, prefix_extractor,
+      s = FindTable(env_options, fd, &handle, prefix_extractor,
                     options.read_tier == kBlockCacheTier /* no_io */,
                     record_stats, file_read_hist, skip_filters, level,
                     true /* prefetch_index_and_filter_in_cache */,
-                    file_meta.prop.is_map_sst());
+                    file_meta.prop.is_map_sst(), file_meta.prop.is_blob_wal());
       if (s.ok()) {
         table_reader = GetTableReaderFromHandle(handle);
       }
@@ -326,59 +313,64 @@ InternalIterator* TableCache::NewIterator(
   }
   InternalIterator* result = nullptr;
   if (s.ok()) {
-    if (!file_meta.prop.is_map_sst()) {
-      if (options.table_filter &&
-          !options.table_filter(*table_reader->GetTableProperties())) {
-        result = NewEmptyInternalIterator<LazyBuffer>(arena);
-      } else {
-        result = table_reader->NewIterator(options, prefix_extractor, arena,
-                                           skip_filters, for_compaction);
-      }
-    } else {
-      ReadOptions map_options = options;
-      map_options.total_order_seek = true;
-      map_options.readahead_size = 0;
-      result =
-          table_reader->NewIterator(map_options, prefix_extractor, arena,
-                                    skip_filters, false /* for_compaction */);
-      if (!dependence_map.empty()) {
-        bool ignore_range_deletions =
-            options.ignore_range_deletions ||
-            file_meta.prop.map_handle_range_deletions();
-        LazyCreateIterator* lazy_create_iter;
-        if (arena != nullptr) {
-          void* buffer = arena->AllocateAligned(sizeof(LazyCreateIterator));
-          lazy_create_iter = new (buffer) LazyCreateIterator(
-              this, options, env_options, icomparator, range_del_agg,
-              prefix_extractor, for_compaction, skip_filters,
-              ignore_range_deletions, level);
+    switch (file_meta.prop.purpose) {
+      case kEssenceSst: {
+        if (options.table_filter &&
+            !options.table_filter(*table_reader->GetTableProperties())) {
+          result = NewEmptyInternalIterator<LazyBuffer>(arena);
+        } else {
+          result = table_reader->NewIterator(options, prefix_extractor, arena,
+                                             skip_filters, for_compaction);
+        }
+      } break;
+      case kMapSst: {
+        ReadOptions map_options = options;
+        map_options.total_order_seek = true;
+        map_options.readahead_size = 0;
+        result =
+            table_reader->NewIterator(map_options, prefix_extractor, arena,
+                                      skip_filters, false /* for_compaction */);
+        if (!dependence_map.empty()) {
+          bool ignore_range_deletions =
+              options.ignore_range_deletions ||
+              file_meta.prop.map_handle_range_deletions();
+          LazyCreateIterator* lazy_create_iter;
+          if (arena != nullptr) {
+            void* buffer = arena->AllocateAligned(sizeof(LazyCreateIterator));
+            lazy_create_iter = new (buffer) LazyCreateIterator(
+                this, options, env_options, range_del_agg, prefix_extractor,
+                for_compaction, skip_filters, ignore_range_deletions, level);
 
-        } else {
-          lazy_create_iter = new LazyCreateIterator(
-              this, options, env_options, icomparator, range_del_agg,
-              prefix_extractor, for_compaction, skip_filters,
-              ignore_range_deletions, level);
+          } else {
+            lazy_create_iter = new LazyCreateIterator(
+                this, options, env_options, range_del_agg, prefix_extractor,
+                for_compaction, skip_filters, ignore_range_deletions, level);
+          }
+          auto map_sst_iter = NewMapSstIterator(
+              &file_meta, result, dependence_map, ioptions_.internal_comparator,
+              lazy_create_iter, c_style_callback(*lazy_create_iter), arena);
+          if (arena != nullptr) {
+            map_sst_iter->RegisterCleanup(
+                [](void* arg1, void* arg2) {
+                  static_cast<InternalIterator*>(arg1)->~InternalIterator();
+                  static_cast<LazyCreateIterator*>(arg2)->~LazyCreateIterator();
+                },
+                result, lazy_create_iter);
+          } else {
+            map_sst_iter->RegisterCleanup(
+                [](void* arg1, void* arg2) {
+                  delete static_cast<InternalIterator*>(arg1);
+                  delete static_cast<LazyCreateIterator*>(arg2);
+                },
+                result, lazy_create_iter);
+          }
+          result = map_sst_iter;
         }
-        auto map_sst_iter = NewMapSstIterator(
-            &file_meta, result, dependence_map, icomparator, lazy_create_iter,
-            c_style_callback(*lazy_create_iter), arena);
-        if (arena != nullptr) {
-          map_sst_iter->RegisterCleanup(
-              [](void* arg1, void* arg2) {
-                static_cast<InternalIterator*>(arg1)->~InternalIterator();
-                static_cast<LazyCreateIterator*>(arg2)->~LazyCreateIterator();
-              },
-              result, lazy_create_iter);
-        } else {
-          map_sst_iter->RegisterCleanup(
-              [](void* arg1, void* arg2) {
-                delete static_cast<InternalIterator*>(arg1);
-                delete static_cast<LazyCreateIterator*>(arg2);
-              },
-              result, lazy_create_iter);
-        }
-        result = map_sst_iter;
-      }
+      } break;
+      case kLogSst: {
+        result =
+            table_reader->NewIteratorWithCF(options, cf_id_, ioptions_, arena);
+      } break;
     }
     if (create_new_table_reader) {
       assert(handle == nullptr);
@@ -422,7 +414,6 @@ InternalIterator* TableCache::NewIterator(
 }
 
 Status TableCache::Get(const ReadOptions& options,
-                       const InternalKeyComparator& internal_comparator,
                        const FileMetaData& file_meta,
                        const DependenceMap& dependence_map, const Slice& k,
                        GetContext* get_context,
@@ -435,12 +426,12 @@ Status TableCache::Get(const ReadOptions& options,
   TableReader* t = fd.table_reader;
   Cache::Handle* handle = nullptr;
   if (t == nullptr) {
-    s = FindTable(env_options_, internal_comparator, fd, &handle,
-                  prefix_extractor,
+    s = FindTable(env_options_, fd, &handle, prefix_extractor,
                   options.read_tier == kBlockCacheTier /* no_io */,
                   true /* record_read_stats */, file_read_hist, skip_filters,
                   level, true /* prefetch_index_and_filter_in_cache */,
-                  file_meta.prop.is_map_sst());
+                  file_meta.prop.is_map_sst() /* force_in_mem */,
+                  file_meta.prop.is_blob_wal());
     if (s.ok()) {
       t = GetTableReaderFromHandle(handle);
     }
@@ -448,115 +439,129 @@ Status TableCache::Get(const ReadOptions& options,
   if (s.ok()) {
     t->UpdateMaxCoveringTombstoneSeq(options, ExtractUserKey(k),
                                      get_context->max_covering_tombstone_seq());
-    if (!file_meta.prop.is_map_sst()) {
-      s = t->Get(options, k, get_context, prefix_extractor, skip_filters);
-    } else if (dependence_map.empty()) {
-      s = Status::Corruption(
-          "TableCache::Get: Composite sst depend files missing");
-    } else {
-      // Forward query to target sst
-      ReadOptions forward_options = options;
-      forward_options.ignore_range_deletions |=
-          file_meta.prop.map_handle_range_deletions();
-      auto get_from_map = [&](const Slice& largest_key,
-                              LazyBuffer&& map_value) {
-        s = map_value.fetch();
-        if (!s.ok()) {
-          return false;
-        }
-        // Manual inline MapSstElement::Decode
-        const char* err_msg = "Map sst invalid link_value";
-        Slice map_input = map_value.slice();
-        Slice smallest_key;
-        uint64_t link_count;
-        uint64_t flags;
-        Slice find_k = k;
-        auto& icomp = internal_comparator;
-
-        if (!GetVarint64(&map_input, &flags) ||
-            !GetVarint64(&map_input, &link_count) ||
-            !GetLengthPrefixedSlice(&map_input, &smallest_key)) {
-          s = Status::Corruption(err_msg);
-          return false;
-        }
-        // don't care kNoRecords, Get call need load
-        // max_covering_tombstone_seq
-        int include_smallest = (flags & MapSstElement::kIncludeSmallest) != 0;
-        int include_largest = (flags & MapSstElement::kIncludeLargest) != 0;
-
-        // include_smallest ? cmp_result > 0 : cmp_result >= 0
-        if (icomp.Compare(smallest_key, k) >= include_smallest) {
-          if (icomp.user_comparator()->Compare(ExtractUserKey(smallest_key),
-                                               ExtractUserKey(k)) != 0) {
-            // k is out of smallest bound
-            return false;
-          }
-          assert(ExtractInternalKeyFooter(k) >
-                 ExtractInternalKeyFooter(smallest_key));
-          if (include_smallest) {
-            // shrink to smallest_key
-            find_k = smallest_key;
-          } else {
-            uint64_t seq_type = ExtractInternalKeyFooter(smallest_key);
-            if (seq_type == 0) {
-              // 'smallest_key' has the largest seq_type of current user_key
-              // k is out of smallest bound
+    switch (file_meta.prop.purpose) {
+      case kEssenceSst: {
+        s = t->Get(options, k, get_context, prefix_extractor, skip_filters);
+      } break;
+      case kMapSst: {
+        if (dependence_map.empty()) {
+          s = Status::Corruption(
+              "TableCache::Get: Composite sst depend files missing");
+        } else {
+          // Forward query to target sst
+          ReadOptions forward_options = options;
+          forward_options.ignore_range_deletions |=
+              file_meta.prop.map_handle_range_deletions();
+          auto get_from_map = [&](const Slice& largest_key,
+                                  LazyBuffer&& map_value) {
+            s = map_value.fetch();
+            if (!s.ok()) {
               return false;
             }
-            // make find_k a bit greater than smallest_key
-            key_buffer.SetInternalKey(smallest_key, true);
-            find_k = key_buffer.GetInternalKey();
-            EncodeFixed64(const_cast<char*>(find_k.data() + find_k.size() - 8),
-                          seq_type - 1);
-          }
-        }
+            // Manual inline MapSstElement::Decode
+            const char* err_msg = "Map sst invalid link_value";
+            Slice map_input = map_value.slice();
+            Slice smallest_key;
+            uint64_t link_count;
+            uint64_t flags;
+            Slice find_k = k;
+            auto& icomp = ioptions_.internal_comparator;
 
-        bool is_largest_user_key =
-            icomp.user_comparator()->Compare(ExtractUserKey(largest_key),
-                                             ExtractUserKey(k)) == 0;
-        uint64_t min_seq_type_backup = get_context->GetMinSequenceAndType();
-        if (is_largest_user_key) {
-          // shrink seqno to largest_key, make sure can't read greater keys
-          uint64_t seq_type = ExtractInternalKeyFooter(largest_key);
-          assert(seq_type <=
-                 PackSequenceAndType(kMaxSequenceNumber, kValueTypeForSeek));
-          // For safety. may kValueTypeForSeek can be 255 in the future ?
-          if (seq_type == port::kMaxUint64 && !include_largest) {
-            // 'largest_key' has the smallest seq_type of current user_key
-            // k is out of largest bound. go next map element
-            return true;
-          }
-          get_context->SetMinSequenceAndType(
-              std::max(min_seq_type_backup, seq_type + !include_largest));
-        }
+            if (!GetVarint64(&map_input, &flags) ||
+                !GetVarint64(&map_input, &link_count) ||
+                !GetLengthPrefixedSlice(&map_input, &smallest_key)) {
+              s = Status::Corruption(err_msg);
+              return false;
+            }
+            // don't care kNoRecords, Get call need load
+            // max_covering_tombstone_seq
+            int include_smallest =
+                (flags & MapSstElement::kIncludeSmallest) != 0;
+            int include_largest = (flags & MapSstElement::kIncludeLargest) != 0;
 
-        uint64_t file_number;
-        for (uint64_t i = 0; i < link_count; ++i) {
-          if (!GetVarint64(&map_input, &file_number)) {
-            s = Status::Corruption(err_msg);
-            return false;
-          }
-          auto find = dependence_map.find(file_number);
-          if (find == dependence_map.end()) {
-            s = Status::Corruption("Map sst dependence missing");
-            return false;
-          }
-          assert(find->second->fd.GetNumber() == file_number);
-          s = Get(forward_options, internal_comparator, *find->second,
-                  dependence_map, find_k, get_context, prefix_extractor,
-                  file_read_hist, skip_filters, level);
+            // include_smallest ? cmp_result > 0 : cmp_result >= 0
+            if (icomp.Compare(smallest_key, k) >= include_smallest) {
+              if (icomp.user_comparator()->Compare(ExtractUserKey(smallest_key),
+                                                   ExtractUserKey(k)) != 0) {
+                // k is out of smallest bound
+                return false;
+              }
+              assert(ExtractInternalKeyFooter(k) >
+                     ExtractInternalKeyFooter(smallest_key));
+              if (include_smallest) {
+                // shrink to smallest_key
+                find_k = smallest_key;
+              } else {
+                uint64_t seq_type = ExtractInternalKeyFooter(smallest_key);
+                if (seq_type == 0) {
+                  // 'smallest_key' has the largest seq_type of current user_key
+                  // k is out of smallest bound
+                  return false;
+                }
+                // make find_k a bit greater than smallest_key
+                key_buffer.SetInternalKey(smallest_key, true);
+                find_k = key_buffer.GetInternalKey();
+                EncodeFixed64(
+                    const_cast<char*>(find_k.data() + find_k.size() - 8),
+                    seq_type - 1);
+              }
+            }
 
-          if (!s.ok() || get_context->is_finished()) {
-            // error or found, recovery min_seq_type_backup is unnecessary
-            return false;
-          }
+            bool is_largest_user_key =
+                icomp.user_comparator()->Compare(ExtractUserKey(largest_key),
+                                                 ExtractUserKey(k)) == 0;
+            uint64_t min_seq_type_backup = get_context->GetMinSequenceAndType();
+            if (is_largest_user_key) {
+              // shrink seqno to largest_key, make sure can't read greater keys
+              uint64_t seq_type = ExtractInternalKeyFooter(largest_key);
+              assert(seq_type <= PackSequenceAndType(kMaxSequenceNumber,
+                                                     kValueTypeForSeek));
+              // For safety. may kValueTypeForSeek can be 255 in the future ?
+              if (seq_type == port::kMaxUint64 && !include_largest) {
+                // 'largest_key' has the smallest seq_type of current user_key
+                // k is out of largest bound. go next map element
+                return true;
+              }
+              get_context->SetMinSequenceAndType(
+                  std::max(min_seq_type_backup, seq_type + !include_largest));
+            }
+
+            uint64_t file_number;
+            for (uint64_t i = 0; i < link_count; ++i) {
+              if (!GetVarint64(&map_input, &file_number)) {
+                s = Status::Corruption(err_msg);
+                return false;
+              }
+              auto find = dependence_map.find(file_number);
+              if (find == dependence_map.end()) {
+                s = Status::Corruption("Map sst dependence missing");
+                return false;
+              }
+              assert(find->second->fd.GetNumber() == file_number);
+              s = Get(forward_options, *find->second, dependence_map, find_k,
+                      get_context, prefix_extractor, file_read_hist,
+                      skip_filters, level);
+
+              if (!s.ok() || get_context->is_finished()) {
+                // error or found, recovery min_seq_type_backup is unnecessary
+                return false;
+              }
+            }
+            // recovery min_seq_backup
+            get_context->SetMinSequenceAndType(min_seq_type_backup);
+            return is_largest_user_key;
+          };
+          s = t->RangeScan(&k, prefix_extractor, &get_from_map,
+                           c_style_callback(get_from_map));
         }
-        // recovery min_seq_backup
-        get_context->SetMinSequenceAndType(min_seq_type_backup);
-        return is_largest_user_key;
-      };
-      t->RangeScan(&k, prefix_extractor, &get_from_map,
-                   c_style_callback(get_from_map));
+      } break;
+      case kLogSst: {
+        // value in wal
+        s = t->GetFromHandle(options, k, get_context);
+#ifndef NDEBUG
+        assert(s.ok());
+#endif  // !NDEBUG
+      } break;
     }
   } else if (options.read_tier == kBlockCacheTier && s.IsIncomplete()) {
     // Couldn't find Table in cache but treat as kFound if no_io set
@@ -570,9 +575,7 @@ Status TableCache::Get(const ReadOptions& options,
 }
 
 Status TableCache::GetTableProperties(
-    const EnvOptions& env_options,
-    const InternalKeyComparator& internal_comparator,
-    const FileMetaData& file_meta,
+    const EnvOptions& env_options, const FileMetaData& file_meta,
     std::shared_ptr<const TableProperties>* properties,
     const SliceTransform* prefix_extractor, bool no_io) {
   Status s;
@@ -586,11 +589,11 @@ Status TableCache::GetTableProperties(
   }
 
   Cache::Handle* table_handle = nullptr;
-  s = FindTable(env_options, internal_comparator, fd, &table_handle,
-                prefix_extractor, no_io, true /* record_read_stats */,
-                nullptr /* file_read_hist */, false /* skip_filters */,
-                -1 /* level */, true /* prefetch_index_and_filter_in_cache */,
-                file_meta.prop.is_map_sst());
+  s = FindTable(env_options, fd, &table_handle, prefix_extractor, no_io,
+                true /* record_read_stats */, nullptr /* file_read_hist */,
+                false /* skip_filters */, -1 /* level */,
+                true /* prefetch_index_and_filter_in_cache */,
+                file_meta.prop.is_map_sst(), file_meta.prop.is_blob_wal());
   if (!s.ok()) {
     return s;
   }
@@ -602,8 +605,7 @@ Status TableCache::GetTableProperties(
 }
 
 size_t TableCache::GetMemoryUsageByTableReader(
-    const EnvOptions& env_options,
-    const InternalKeyComparator& internal_comparator, const FileDescriptor& fd,
+    const EnvOptions& env_options, const FileDescriptor& fd,
     const SliceTransform* prefix_extractor) {
   Status s;
   auto table_reader = fd.table_reader;
@@ -613,8 +615,7 @@ size_t TableCache::GetMemoryUsageByTableReader(
   }
 
   Cache::Handle* table_handle = nullptr;
-  s = FindTable(env_options, internal_comparator, fd, &table_handle,
-                prefix_extractor, true);
+  s = FindTable(env_options, fd, &table_handle, prefix_extractor, true);
   if (!s.ok()) {
     return 0;
   }

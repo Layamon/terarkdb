@@ -54,6 +54,13 @@ struct FileDescriptor {
         smallest_seqno(_smallest_seqno),
         largest_seqno(_largest_seqno) {}
 
+  FileDescriptor(const FileDescriptor& fd)
+      : table_reader(fd.table_reader),
+        packed_number_and_path_id(fd.packed_number_and_path_id),
+        file_size(fd.GetFileSize()),
+        smallest_seqno(fd.smallest_seqno),
+        largest_seqno(fd.largest_seqno) {}
+
   FileDescriptor& operator=(const FileDescriptor& fd) {
     table_reader = fd.table_reader;
     packed_number_and_path_id = fd.packed_number_and_path_id;
@@ -102,7 +109,9 @@ struct TablePropertyCache {
   std::vector<Dependence> dependence;       // make these sst hidden
   std::vector<uint64_t> inheritance_chain;  // inheritance chain
 
+  bool is_essence_sst() const { return purpose == kEssenceSst; }
   bool is_map_sst() const { return purpose == kMapSst; }
+  bool is_blob_wal() const { return purpose == kLogSst; }
   bool has_range_deletions() const { return (flags & kNoRangeDeletions) == 0; }
   bool map_handle_range_deletions() const {
     return (flags & kMapHandleRangeDeletions) != 0;
@@ -111,6 +120,13 @@ struct TablePropertyCache {
 };
 
 struct FileMetaData {
+  enum GCStatus : uint8_t {
+    kGarbageCollectionForbidden = 0,
+    kGarbageCollectionCandidate = 1,
+    kGarbageCollectionPermitted = 2,
+    kGarbageCollectionDefered = 3,
+  };
+
   FileDescriptor fd;
   InternalKey smallest;  // Smallest internal key served by table
   InternalKey largest;   // Largest internal key served by table
@@ -139,7 +155,7 @@ struct FileMetaData {
 
   bool need_upgrade;  // this sst from origin rocksdb
 
-  uint8_t gc_status;  // for gc picker
+  GCStatus gc_status;  // for gc picker
 
   TablePropertyCache prop;  // Cache some TableProperty fields into manifest
 
@@ -193,12 +209,6 @@ struct FileMetaData {
     fd.largest_seqno = std::max(fd.largest_seqno, seqno);
   }
 
-  enum {
-    kGarbageCollectionForbidden = 0,
-    kGarbageCollectionCandidate = 1,
-    kGarbageCollectionPermitted = 2,
-  };
-
   bool is_gc_forbidden() const {
     return gc_status == kGarbageCollectionForbidden;
   }
@@ -208,8 +218,11 @@ struct FileMetaData {
   bool is_gc_permitted() const {
     return gc_status == kGarbageCollectionPermitted;
   }
+  bool is_gc_defered() const { return gc_status == kGarbageCollectionDefered; }
   void set_gc_candidate() { gc_status = kGarbageCollectionCandidate; }
 };
+
+typedef std::unordered_map<uint64_t, FileMetaData*> DependenceMap;
 
 // A compressed copy of file meta data that just contain minimum data needed
 // to server read operations, while still keeping the pointer to full metadata
@@ -290,8 +303,11 @@ class VersionEdit {
                const InternalKey& largest, const SequenceNumber& smallest_seqno,
                const SequenceNumber& largest_seqno, bool marked_for_compaction,
                const TablePropertyCache& prop) {
-    assert(smallest_seqno <= largest_seqno);
+    assert(smallest_seqno <= largest_seqno || prop.purpose == kLogSst);
     FileMetaData f;
+    f.gc_status = prop.is_blob_wal()
+                      ? FileMetaData::kGarbageCollectionDefered
+                      : FileMetaData::kGarbageCollectionForbidden;
     f.fd = FileDescriptor(file, file_path_id, file_size, smallest_seqno,
                           largest_seqno);
     f.smallest = smallest;

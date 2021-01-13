@@ -470,7 +470,8 @@ ColumnFamilyData::ColumnFamilyData(
   if (_dummy_versions != nullptr) {
     internal_stats_.reset(
         new InternalStats(ioptions_.num_levels, db_options.env, this));
-    table_cache_.reset(new TableCache(ioptions_, env_options, _table_cache));
+    table_cache_.reset(
+        new TableCache(id_, ioptions_, db_options, env_options, _table_cache));
     if (ioptions_.compaction_style == kCompactionStyleLevel) {
       compaction_picker_.reset(new LevelCompactionPicker(
           table_cache_.get(), env_options, ioptions_, &internal_comparator_));
@@ -994,7 +995,9 @@ bool ColumnFamilyData::NeedsCompaction() const {
 bool ColumnFamilyData::NeedsGarbageCollection() const {
   auto vstorage = current_->storage_info();
   return !vstorage->IsPickGarbageCollectionFail() &&
-         vstorage->total_garbage_ratio() >= mutable_cf_options_.blob_gc_ratio;
+         (vstorage->total_garbage_ratio() >=
+              mutable_cf_options_.blob_gc_ratio ||
+          !vstorage->blob_wal_dependence().empty());
 }
 
 Compaction* ColumnFamilyData::PickCompaction(
@@ -1014,11 +1017,14 @@ Compaction* ColumnFamilyData::PickCompaction(
 }
 
 Compaction* ColumnFamilyData::PickGarbageCollection(
-    const MutableCFOptions& mutable_options, LogBuffer* log_buffer) {
+    uint64_t min_log_number_to_keep, const MutableCFOptions& mutable_options,
+    LogBuffer* log_buffer) {
   StopWatch sw(ioptions_.env, ioptions_.statistics,
                PICK_GARBAGE_COLLECTION_TIME);
+
   auto* result = compaction_picker_->PickGarbageCollection(
-      GetName(), mutable_options, current_->storage_info(), log_buffer);
+      GetName(), min_log_number_to_keep, mutable_options,
+      current_->storage_info(), log_buffer);
   if (result != nullptr) {
     result->SetInputVersion(current_);
     result->set_compaction_load(0);
@@ -1326,6 +1332,10 @@ Directory* ColumnFamilyData::GetDataDir(size_t path_id) const {
 
   assert(path_id < data_dirs_.size());
   return data_dirs_[path_id].get();
+}
+
+std::string ColumnFamilyData::GetWalDir() const {
+  return column_family_set_->db_options_->wal_dir;
 }
 
 ColumnFamilySet::ColumnFamilySet(const std::string& dbname,

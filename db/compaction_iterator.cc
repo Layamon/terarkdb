@@ -5,6 +5,10 @@
 
 #include "db/compaction_iterator.h"
 
+#include <boost/range/algorithm.hpp>
+
+#include "db/dbformat.h"
+#include "db/log_writer.h"
 #include "db/snapshot_checker.h"
 #include "port/likely.h"
 #include "rocksdb/listener.h"
@@ -71,7 +75,7 @@ void CompactionIteratorToInternalIterator::Seek(const Slice& target) {
 
     c_iter_->current_user_key_sequence_ = 0;
     c_iter_->current_user_key_snapshot_ = 0;
-    c_iter_->merge_out_iter_ = MergeOutputIterator(c_iter_->merge_helper_);
+    c_iter_->merge_out_iter_ = std::move(*c_iter_->merge_helper_).NewIterator();
     c_iter_->current_key_committed_ = false;
     for (auto& v : c_iter_->level_ptrs_) {
       v = 0;
@@ -155,7 +159,7 @@ CompactionIterator::CompactionIterator(
       ignore_snapshots_(false),
       current_user_key_sequence_(0),
       current_user_key_snapshot_(0),
-      merge_out_iter_(merge_helper_),
+      merge_out_iter_(std::move(*merge_helper_).NewIterator()),
       current_key_committed_(false) {
   assert(compaction_filter_ == nullptr || compaction_ != nullptr);
   bottommost_level_ =
@@ -216,8 +220,7 @@ void CompactionIterator::Next() {
     // Check if we returned all records of the merge output.
     if (merge_out_iter_.Valid()) {
       key_ = merge_out_iter_.key();
-      value_ = LazyBufferReference(merge_out_iter_.value());
-      value_meta_.clear();
+      value_ = std::move(merge_out_iter_).value();
       bool valid_key __attribute__((__unused__));
       valid_key = ParseInternalKey(key_, &ikey_);
       // MergeUntil stops when it encounters a corrupt key and does not
@@ -268,10 +271,16 @@ void CompactionIterator::InvokeFilterIfNeeded(bool* need_skip,
     compaction_filter_value_.clear();
     compaction_filter_skip_until_.Clear();
     auto doFilter = [&]() {
+      std::string meta;
+      if (input_.separate_helper() != nullptr) {
+        meta = input_.separate_helper()->GetValueMeta(
+            current_key_.GetInternalKey(), value_);
+      }
       filter = compaction_filter_->FilterV2(
           compaction_->level(), ikey_.user_key,
-          CompactionFilter::ValueType::kValue, value_meta_, value_,
-          &compaction_filter_value_, compaction_filter_skip_until_.rep());
+          CompactionFilter::ValueType::kValue, Slice(meta.data(), meta.size()),
+          value_, &compaction_filter_value_,
+          compaction_filter_skip_until_.rep());
     };
     auto sample = filter_sample_interval_;
     if (env_ && sample && (filter_hit_count_ & (sample - 1)) == 0) {
@@ -373,7 +382,7 @@ void CompactionIterator::NextFromInput() {
       // First occurrence of this user key
       // Copy key for output
       key_ = current_key_.SetInternalKey(key_, &ikey_);
-      value_ = input_.value(current_key_.GetUserKey(), &value_meta_);
+      value_ = input_.value(current_key_.GetUserKey());
       current_user_key_ = ikey_.user_key;
       has_current_user_key_ = true;
       has_outputted_key_ = false;
@@ -396,7 +405,7 @@ void CompactionIterator::NextFromInput() {
       // if we have versions on both sides of a snapshot
       current_key_.UpdateInternalKey(ikey_.sequence, ikey_.type);
       key_ = current_key_.GetInternalKey();
-      value_ = input_.value(current_key_.GetUserKey(), &value_meta_);
+      value_ = input_.value(current_key_.GetUserKey());
       ikey_.user_key = current_key_.GetUserKey();
 
       // Note that newer version of a key is ordered before older versions. If a
@@ -664,17 +673,16 @@ void CompactionIterator::NextFromInput() {
       Status s = merge_helper_->MergeUntil(current_key_.GetUserKey(), &input_,
                                            range_del_agg_, prev_snapshot,
                                            bottommost_level_);
-      merge_out_iter_.SeekToFirst();
 
       if (!s.ok() && !s.IsMergeInProgress()) {
         status_ = s;
         return;
-      } else if (merge_out_iter_.Valid()) {
+      } else if (!merge_helper_->Empty()) {
+        merge_out_iter_ = std::move(*merge_helper_).NewIterator();
         // NOTE: key, value, and ikey_ refer to old entries.
         //       These will be correctly set below.
         key_ = merge_out_iter_.key();
-        value_ = LazyBufferReference(merge_out_iter_.value());
-        value_meta_.clear();
+        value_ = std::move(merge_out_iter_).value();
         bool valid_key __attribute__((__unused__));
         valid_key = ParseInternalKey(key_, &ikey_);
         // MergeUntil stops when it encounters a corrupt key and does not
@@ -747,24 +755,55 @@ void CompactionIterator::PrepareOutput() {
         (current_user_key_.size() << 16) <=
             value_.size() * blob_large_key_ratio_lsh16_) {
       if (value_.file_number() != uint64_t(-1)) {
+        s = input_.separate_helper()->TransToSeparate(
+            current_key_.GetInternalKey(), value_,
+            ikey_.type == kTypeMerge, false);
         ikey_.type =
             ikey_.type == kTypeValue ? kTypeValueIndex : kTypeMergeIndex;
         current_key_.UpdateInternalKey(ikey_.sequence, ikey_.type);
-        s = input_.separate_helper()->TransToSeparate(
-            current_key_.GetInternalKey(), value_, value_meta_,
-            ikey_.type == kTypeMergeIndex, false);
         if (!s.ok()) {
           valid_ = false;
           status_ = std::move(s);
         }
+#ifndef NDEBUG
+        {
+          auto s = value_.fetch();
+          if (!s.ok()) {
+            return;
+          }
+          ValueIndex value_index(value_.slice());
+          if (value_index.log_type == ValueIndex::kDefault) {
+            DefaultLogHandle content(value_index.log_handle);
+            assert(content.length != 0);
+          } else {
+            assert(!value_index.log_handle.valid());
+          }
+        }
+#endif  // !NDEBUG
         return;
       }
+
       s = input_.separate_helper()->TransToSeparate(
           current_key_.GetInternalKey(), value_);
       if (s.ok()) {
         ikey_.type =
-            ikey_.type == kTypeValue ? kTypeValueIndex : kTypeMergeIndex;
+            (ikey_.type == kTypeValue) ? kTypeValueIndex : kTypeMergeIndex;
         current_key_.UpdateInternalKey(ikey_.sequence, ikey_.type);
+#ifndef NDEBUG
+        {
+          auto s = value_.fetch();
+          if (!s.ok()) {
+            return;
+          }
+          ValueIndex value_index(value_.slice());
+          if (value_index.log_type == ValueIndex::kDefault) {
+            DefaultLogHandle content(value_index.log_handle);
+            assert(content.length != 0);
+          } else {
+            assert(!value_index.log_handle.valid());
+          }
+        }
+#endif  // !NDEBUG
         return;
       }
       if (!s.IsNotSupported()) {
@@ -775,14 +814,31 @@ void CompactionIterator::PrepareOutput() {
     }
   }
   if (ikey_.type == kTypeValueIndex || ikey_.type == kTypeMergeIndex) {
+    // for value being separated in upper if-statement, do packaging here
+    // also separating value MUST has its source
     assert(value_.file_number() != uint64_t(-1));
     auto s = input_.separate_helper()->TransToSeparate(
-        current_key_.GetInternalKey(), value_, value_meta_,
-        ikey_.type == kTypeMergeIndex, true);
+        current_key_.GetInternalKey(), value_, ikey_.type == kTypeMergeIndex,
+        true);
     if (!s.ok()) {
       valid_ = false;
       status_ = std::move(s);
     }
+#ifndef NDEBUG
+    {
+      auto s = value_.fetch();
+      if (!s.ok()) {
+        return;
+      }
+      ValueIndex value_index(value_.slice());
+      if (value_index.log_type == ValueIndex::kDefault) {
+        DefaultLogHandle content(value_index.log_handle);
+        assert(content.length != 0);
+      } else {
+        assert(!value_index.log_handle.valid());
+      }
+    }
+#endif  // !NDEBUG
     return;
   }
   if ((compaction_ != nullptr && !compaction_->allow_ingest_behind()) &&
@@ -828,4 +884,190 @@ inline bool CompactionIterator::ikeyNotNeededForIncrementalSnapshot() {
          (ikey_.sequence < preserve_deletes_seqnum_);
 }
 
+std::string CompactionSeparateHelper::GetValueMeta(const Slice& internal_key,
+                                                   const LazyBuffer& value) {
+  std::string value_meta;
+  auto s = value.fetch();                                              
+  assert(s.ok());
+  bool value_is_separated =
+      (GetInternalKeyType(internal_key) == kTypeValueIndex ||
+       GetInternalKeyType(internal_key) == kTypeMergeIndex);
+  if (value_is_separated) {
+    // only separated value need value meta
+    assert(dynamic_cast<const CompactionLazyBufferState*>(value.state()) !=
+           nullptr);
+    LazyBuffer& value_from_iter =
+        static_cast<const CompactionLazyBufferState*>(value.state())->value();
+    assert(value_from_iter.valid());
+
+    ValueIndex value_index(value_from_iter.slice());
+
+    bool value_in_log = value_index.log_type == ValueIndex::kDefault;
+    bool value_from_memtable = value_from_iter.file_number() == uint64_t(-1);
+    if ((value_in_log && value_from_memtable) ||
+        value_meta_extractor == nullptr) {
+      return "";  // no meta
+    }
+
+    // extractor value meta of current value
+    s = value_meta_extractor->Extract(
+        ExtractUserKey(internal_key),
+        Slice(value.slice().data(), value.slice().size()), &value_meta);
+    assert(s.ok());
+  }
+  return value_meta;
+}
+
+Status CompactionSeparateHelper::TransToSeparate(const Slice& internal_key,
+                                                 LazyBuffer& value,
+                                                 bool is_merge, bool is_index) {
+  assert(value.valid());
+  if (value.file_number() == uint64_t(-1)) {
+    // separating value into this function MUST has its source, non-source
+    // separating value need transto_separate callback
+    assert(false);
+    return Status::Aborted();
+  }
+
+  Slice log_handle = Slice::Invalid();
+  std::string value_meta_storage;
+  Status s;
+  if (!is_index) {
+    // for normal value, just extract value meta
+    if (value_meta_extractor != nullptr && !is_merge) {
+      s = value_meta_extractor->Extract(ExtractUserKey(internal_key),
+                                        value.slice(), &value_meta_storage);
+    }
+  } else {
+    // for value index, keep value handle if has it(drop it only file_number
+    // update), and get value meta if not have it.
+    // Because after NextFromInput value can be changed(not the original value
+    // index), log_handle maybe lose, recovery it from value index backup in
+    // value's state
+#ifndef NDEBUG
+    assert(dynamic_cast<const CompactionLazyBufferState*>(value.state()) !=
+           nullptr);
+#endif  // !NDEBUG
+
+    LazyBuffer value_index_backuped = std::move(
+        static_cast<const CompactionLazyBufferState*>(value.state())->value());
+    assert(value_index_backuped.valid());
+    ValueIndex value_index(value_index_backuped.slice());
+
+    if (value_index_backuped.file_number() == uint64_t(-1)) {
+      // FLUSH job, extract value_meta and keep old log_handle
+      if (value_meta_extractor != nullptr && !is_merge) {
+        // XXX WHY merge DO NOT extract?
+        assert(value.slice() == value_index.meta_or_value);
+        s = value_meta_extractor->Extract(ExtractUserKey(internal_key),
+                                          value.slice(), &value_meta_storage);
+      }
+      log_handle = value_index.log_handle;
+    } else {
+      // COMPACT job, keep value_meta and expire log_handle
+      // need copy data, since value_index_backuped's state can be destory in
+      // value.reset, the same as log_handle
+      value_meta_storage.append(value_index.meta_or_value.data(),
+                                value_index.meta_or_value.size());
+      if (value.file_number() != value_index.file_number) {
+        log_handle = Slice::Invalid();
+      } else {
+        log_handle = value_index.log_handle;
+      }
+    }
+  }
+  if (!s.ok()) {
+    return s;
+  }
+
+  if (log_handle.valid()) {
+    uint64_t packed_file_no = value.file_number() | ValueIndex::kDefault;
+    char log_handle_storage[kDefaultLogHandleSize];
+    ::memcpy(&log_handle_storage[0], log_handle.data(), log_handle.size());
+    Slice parts[] = {EncodeFileNumber(packed_file_no),
+                     Slice(log_handle_storage, kDefaultLogHandleSize),
+                     value_meta_storage};
+    value.reset(SliceParts(parts, 3), value.file_number());
+  } else {
+    uint64_t file_no = value.file_number();
+    assert((file_no & ValueIndex::kLogHandleTypeMask) != ValueIndex::kDefault);
+    Slice parts[] = {EncodeFileNumber(file_no), value_meta_storage};
+    value.reset(SliceParts(parts, 2), value.file_number());
+  }
+
+#ifndef NDEBUG
+  if (log_handle.valid()) {
+    auto s = value.fetch();
+    if (!s.ok()) {
+      return s;
+    }
+    ValueIndex value_index(value.slice());
+    if (value_index.log_type == ValueIndex::kDefault) {
+      DefaultLogHandle content(value_index.log_handle);
+      assert(content.length != 0);
+    } else {
+      assert(!value_index.log_handle.valid());
+    }
+  }
+  assert(value.file_number() != -1 && value.file_number() != 0);
+#endif  // !NDEBUG
+  return s;
+}
+
+LazyBuffer CompactionSeparateHelper::TransToCombined(
+    const Slice& user_key, uint64_t sequence,
+    LazyBuffer&& original_value) const {
+  // move original value into new value's state
+  auto self = const_cast<CompactionSeparateHelper*>(this);
+  auto state = self->AllocState();
+
+#ifndef NDEBUG
+  auto status = original_value.fetch();
+  if (!status.ok()) {
+    return LazyBuffer(std::move(status));
+  }
+  ValueIndex _value_index(original_value.slice());
+#endif  // !NDEBUG
+
+  state->value() = std::move(original_value);
+  state->value().pin(LazyBufferPinLevel::Internal);
+  auto s = state->value().fetch();
+  if (!s.ok()) {
+    return LazyBuffer(std::move(s));
+  }
+
+  ValueIndex value_index(state->value().slice());
+
+#ifndef NDEBUG
+  if (value_index.log_type == ValueIndex::kDefault) {
+    DefaultLogHandle content(value_index.log_handle);
+    assert(content.length != 0);
+  } else {
+    assert(!value_index.log_handle.valid());
+  }
+#endif
+
+  LazyBuffer combined_value;
+  if (state->value().file_number() == uint64_t(-1)) {
+    assert(value_index.file_number != 0 && value_index.file_number != -1);
+    // FLUSH job
+    combined_value.reset(value_index.meta_or_value, Cleanable(),
+                         value_index.file_number);
+  } else {
+    // COMPACT job
+    combined_value = separate_helper->TransToCombined(
+        user_key, sequence, LazyBufferReference(state->value()));
+  }
+  s = combined_value.fetch();
+  if (!s.ok()) {
+    combined_value.reset(std::move(s));
+  }
+  // combined_value is a lazybuffer pointing to blob-sst or blob-wal, if it from
+  // blob-wal, state save the original value's log_handle for latter separating.
+  // once combined value returned, its state may be destory by others. so we
+  // keep current separate helper in state so that when state destoryed, helper
+  // can reclaim state
+  combined_value.wrap_state(state);
+  return combined_value;
+}
 }  // namespace rocksdb

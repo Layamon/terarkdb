@@ -359,7 +359,13 @@ Status WriteCommittedTxn::CommitInternal() {
   // insert prepared batch into Memtable only skipping WAL.
   // Memtable will ignore BeginPrepare/EndPrepare markers
   // in non recovery mode and simply insert the values
-  WriteBatchInternal::Append(working_batch, GetWriteBatch()->GetWriteBatch());
+  WriteBatch* prepared_batch = GetWriteBatch()->GetWriteBatch();
+  WriteBatchInternal::Append(working_batch, prepared_batch);
+  if (!prepared_batch->WalPositionInvalid()) {
+    working_batch->SetWalPosition(
+        prepared_batch->GetWalPosition().wal_offset_of_wb_content,
+        prepared_batch->GetWalPosition().log_number);
+  }
 
   uint64_t seq_used = kMaxSequenceNumber;
   auto s =

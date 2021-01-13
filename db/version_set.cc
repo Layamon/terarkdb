@@ -359,8 +359,17 @@ Version::~Version() {
         assert(cfd_ != nullptr);
         uint32_t path_id = f->fd.GetPathId();
         assert(path_id < cfd_->ioptions()->cf_paths.size());
-        vset_->obsolete_files_.push_back(
-            ObsoleteFileInfo(f, cfd_->ioptions()->cf_paths[path_id].path));
+        if (f->prop.is_blob_wal()) {
+          vset_->obsolete_files_.push_back(
+              ObsoleteFileInfo(f, cfd_->GetWalDir()));
+#ifndef NDEBUG
+          ROCKS_LOG_INFO(vset_->db_options_->info_log, "PushBackWal #%" PRIu64,
+                         f->fd.GetNumber());
+#endif  // !NDEBUG
+        } else {
+          vset_->obsolete_files_.push_back(
+              ObsoleteFileInfo(f, cfd_->ioptions()->cf_paths[path_id].path));
+        }
       }
     }
   }
@@ -532,6 +541,7 @@ class LevelIterator final : public InternalIterator, public Snapshot {
                *read_options_.iterate_upper_bound) >= 0;
   }
 
+
   InternalIterator* NewFileIterator() {
     assert(file_index_ < flevel_->num_files);
     auto file_meta = flevel_->files[file_index_];
@@ -539,8 +549,8 @@ class LevelIterator final : public InternalIterator, public Snapshot {
       sample_file_read_inc(file_meta.file_metadata);
     }
     return table_cache_->NewIterator(
-        read_options_, env_options_, icomparator_, *file_meta.file_metadata,
-        dependence_map_, range_del_agg_, prefix_extractor_,
+        read_options_, env_options_, *file_meta.file_metadata, dependence_map_,
+        range_del_agg_, prefix_extractor_,
         nullptr /* don't need reference to table */, file_read_hist_,
         for_compaction_, nullptr /* arena */, skip_filters_, level_);
   }
@@ -703,7 +713,9 @@ class BaseReferencedVersionBuilder {
     versions->LogAndApplyHelper(version_->cfd(), version_builder_, version_,
                                 edit, mu, false);
   }
-  void DoApplyAndSaveTo(VersionStorageInfo* vstorage) {
+  void DoApplyAndSaveTo(VersionStorageInfo* vstorage, VersionSet* vset) {
+    // in Apply, collect each blob wal's used_entries,
+    // in SaveTo, use num_entries - used_entries to get num_antiquation
     for (auto edit : edit_list_) {
       version_builder_->Apply(edit);
     }
@@ -723,8 +735,8 @@ Status Version::GetTableProperties(std::shared_ptr<const TableProperties>* tp,
   auto table_cache = cfd_->table_cache();
   auto ioptions = cfd_->ioptions();
   Status s = table_cache->GetTableProperties(
-      env_options_, cfd_->internal_comparator(), *file_meta, tp,
-      mutable_cf_options_.prefix_extractor.get(), true /* no io */);
+      env_options_, *file_meta, tp, mutable_cf_options_.prefix_extractor.get(),
+      true /* no io */);
   if (s.ok()) {
     return s;
   }
@@ -889,13 +901,13 @@ size_t Version::GetMemoryUsageByTableReaders() {
   for (auto& file_level : storage_info_.level_files_brief_) {
     for (size_t i = 0; i < file_level.num_files; i++) {
       total_usage += cfd_->table_cache()->GetMemoryUsageByTableReader(
-          env_options_, cfd_->internal_comparator(), file_level.files[i].fd,
+          env_options_, file_level.files[i].fd,
           mutable_cf_options_.prefix_extractor.get());
     }
   }
   for (auto file_meta : storage_info_.LevelFiles(-1)) {
     total_usage += cfd_->table_cache()->GetMemoryUsageByTableReader(
-        env_options_, cfd_->internal_comparator(), file_meta->fd,
+        env_options_, file_meta->fd,
         mutable_cf_options_.prefix_extractor.get());
   }
   return total_usage;
@@ -1076,8 +1088,8 @@ void Version::AddIteratorsForLevel(const ReadOptions& read_options,
          i++) {
       const auto& file = storage_info_.LevelFilesBrief(level).files[i];
       merge_iter_builder->AddIterator(cfd_->table_cache()->NewIterator(
-          read_options, soptions, cfd_->internal_comparator(),
-          *file.file_metadata, storage_info_.dependence_map(), range_del_agg,
+          read_options, soptions, *file.file_metadata,
+          storage_info_.dependence_map(), range_del_agg,
           mutable_cf_options_.prefix_extractor.get(), nullptr,
           cfd_->internal_stats()->GetFileReadHist(level), false, arena,
           false /* skip_filters */, 0 /* level */));
@@ -1133,8 +1145,8 @@ Status Version::OverlapWithLevelIterator(const ReadOptions& read_options,
         continue;
       }
       ScopedArenaIterator iter(cfd_->table_cache()->NewIterator(
-          read_options, env_options, cfd_->internal_comparator(),
-          *file->file_metadata, storage_info_.dependence_map(), &range_del_agg,
+          read_options, env_options, *file->file_metadata,
+          storage_info_.dependence_map(), &range_del_agg,
           mutable_cf_options_.prefix_extractor.get(), nullptr,
           cfd_->internal_stats()->GetFileReadHist(level), false, &arena,
           false /* skip_filters */, 0 /* level */));
@@ -1197,6 +1209,7 @@ VersionStorageInfo::VersionStorageInfo(
       finalized_(false),
       is_pick_compaction_fail(false),
       is_pick_garbage_collection_fail(false),
+      is_pick_wal_index_creation_fail(false),
       force_consistency_checks_(_force_consistency_checks) {
   ++files_;  // level -1 used for dependence files
 }
@@ -1230,35 +1243,71 @@ Version::Version(ColumnFamilyData* column_family_data, VersionSet* vset,
 
 Status Version::fetch_buffer(LazyBuffer* buffer) const {
   auto context = get_context(buffer);
-  Slice user_key(reinterpret_cast<const char*>(context->data[0]),
-                 context->data[1]);
-  uint64_t sequence = context->data[2];
   auto pair = *reinterpret_cast<DependenceMap::value_type*>(context->data[3]);
-  bool value_found = false;
-  SequenceNumber context_seq;
-  GetContext get_context(cfd_->internal_comparator().user_comparator(), nullptr,
-                         cfd_->ioptions()->info_log, db_statistics_,
-                         GetContext::kNotFound, user_key, buffer, &value_found,
-                         nullptr, nullptr, nullptr, env_, &context_seq);
-  IterKey iter_key;
-  iter_key.SetInternalKey(user_key, sequence, kValueTypeForSeek);
-  auto s = table_cache_->Get(
-      ReadOptions(), cfd_->internal_comparator(), *pair.second,
-      storage_info_.dependence_map(), iter_key.GetInternalKey(), &get_context,
-      mutable_cf_options_.prefix_extractor.get(), nullptr, true);
-  if (!s.ok()) {
-    return s;
-  }
-  if (context_seq != sequence || (get_context.State() != GetContext::kFound &&
-                                  get_context.State() != GetContext::kMerge)) {
-    if (get_context.State() == GetContext::kCorrupt) {
-      return std::move(get_context).CorruptReason();
-    } else {
-      char buf[128];
-      snprintf(buf, sizeof buf,
-               "file number = %" PRIu64 "(%" PRIu64 "), sequence = %" PRIu64,
-               pair.second->fd.GetNumber(), pair.first, sequence);
-      return Status::Corruption("Separate value missing", buf);
+
+  Status s;
+  if (!pair.second->prop.is_blob_wal()) {
+    // normal value
+    Slice user_key(reinterpret_cast<const char*>(context->data[0]),
+                   context->data[1]);
+    uint64_t sequence = context->data[2];
+    bool value_found = false;
+    SequenceNumber context_seq;
+    GetContext get_context(cfd_->internal_comparator().user_comparator(),
+                           nullptr, cfd_->ioptions()->info_log, db_statistics_,
+                           GetContext::kNotFound, user_key, buffer,
+                           &value_found, nullptr, nullptr, nullptr, env_,
+                           &context_seq);
+    IterKey iter_key;
+    iter_key.SetInternalKey(user_key, sequence, kValueTypeForSeek);
+    s = table_cache_->Get(
+        ReadOptions(), *pair.second, storage_info_.dependence_map(),
+        iter_key.GetInternalKey(), &get_context,
+        mutable_cf_options_.prefix_extractor.get(), nullptr, true);
+    if (!s.ok()) {
+      return s;
+    }
+    if (context_seq != sequence || get_context.is_index() ||
+        !get_context.is_finished() ||
+        (get_context.State() != GetContext::kFound &&
+         get_context.State() != GetContext::kMerge)) {
+      if (get_context.State() == GetContext::kCorrupt) {
+        return std::move(get_context).CorruptReason();
+      } else {
+        char buf[128];
+        snprintf(buf, sizeof buf,
+                 "file number = %" PRIu64 "(%" PRIu64 "), sequence = %" PRIu64,
+                 pair.second->fd.GetNumber(), pair.first, sequence);
+        return Status::Corruption("Separate value missing", buf);
+      }
+    }
+  } else {
+    assert(pair.second->prop.is_blob_wal());
+    Slice log_handle(reinterpret_cast<const char*>(&context->data[0]),
+                     kDefaultLogHandleSize);
+    bool value_found = false;
+    GetContext get_context(cfd_->internal_comparator().user_comparator(),
+                           nullptr, cfd_->ioptions()->info_log, db_statistics_,
+                           GetContext::kNotFound, log_handle, buffer,
+                           &value_found, nullptr, nullptr, nullptr, env_);
+    s = table_cache_->Get(
+        ReadOptions(), *pair.second, storage_info_.dependence_map(), log_handle,
+        &get_context, mutable_cf_options_.prefix_extractor.get(), nullptr,
+        true);
+    if (!s.ok()) {
+      return s;
+    }
+
+    if (get_context.State() != GetContext::kFound || get_context.is_index() ||
+        !get_context.is_finished()) {
+      if (get_context.State() == GetContext::kCorrupt) {
+        return std::move(get_context).CorruptReason();
+      } else {
+        char buf[128];
+        snprintf(buf, sizeof buf, "file number = %" PRIu64 "(%" PRIu64 ")",
+                 pair.second->fd.GetNumber(), pair.first);
+        return Status::Corruption("Separate value missing", buf);
+      }
     }
   }
   assert(buffer->file_number() == pair.second->fd.GetNumber());
@@ -1266,23 +1315,41 @@ Status Version::fetch_buffer(LazyBuffer* buffer) const {
 }
 
 LazyBuffer Version::TransToCombined(const Slice& user_key, uint64_t sequence,
-                                    const LazyBuffer& value) const {
+                                    LazyBuffer&& value) const {
   auto s = value.fetch();
   if (!s.ok()) {
     return LazyBuffer(std::move(s));
   }
-  uint64_t file_number = SeparateHelper::DecodeFileNumber(value.slice());
+  ValueIndex value_index(value.slice());
   auto& dependence_map = storage_info_.dependence_map();
-  auto find = dependence_map.find(file_number);
+  auto find = dependence_map.find(value_index.file_number);
   if (find == dependence_map.end()) {
     return LazyBuffer(Status::Corruption("Separate value dependence missing"));
-  } else {
-    return LazyBuffer(
-        this,
-        {reinterpret_cast<uint64_t>(user_key.data()), user_key.size(), sequence,
-         reinterpret_cast<uint64_t>(&*find)},
-        Slice::Invalid(), find->second->fd.GetNumber());
   }
+  LazyBufferContext context;
+  if (find->second->prop.is_blob_wal()) {
+#ifndef NDEBUG
+    assert(value_index.log_type == ValueIndex::kDefault);
+    assert(value_index.log_handle.valid() &&
+           value_index.log_handle.size() == kDefaultLogHandleSize);
+    DefaultLogHandle content(value_index.log_handle);
+    assert(content.length >= mutable_cf_options_.blob_size);
+#endif
+    // has value index content, fetch buffer use handle in value index content
+    memcpy(&context.data, value_index.log_handle.data(), kDefaultLogHandleSize);
+    context.data[2] = kMaxSequenceNumber;
+  } else {
+    // no content in value index, use key to fetch buffer
+    context.data[0] = reinterpret_cast<uint64_t>(user_key.data());
+    context.data[1] = user_key.size();
+    context.data[2] = sequence;
+  }
+  context.data[3] = reinterpret_cast<uint64_t>(&*find);
+  uint64_t value_file_no = find->second->fd.GetNumber();
+#ifndef NDEBUG
+  assert(value_file_no != uint64_t(-1));
+#endif  // !NDEBUG
+  return LazyBuffer(this, context, Slice::Invalid(), value_file_no);
 }
 
 void Version::Get(const ReadOptions& read_options, const Slice& user_key,
@@ -1327,9 +1394,8 @@ void Version::Get(const ReadOptions& read_options, const Slice& user_key,
         get_perf_context()->per_level_perf_context_enabled;
     StopWatchNano timer(env_, timer_enabled /* auto_start */);
     *status = table_cache_->Get(
-        read_options, *internal_comparator(), *f->file_metadata,
-        storage_info_.dependence_map(), ikey, &get_context,
-        mutable_cf_options_.prefix_extractor.get(),
+        read_options, *f->file_metadata, storage_info_.dependence_map(), ikey,
+        &get_context, mutable_cf_options_.prefix_extractor.get(),
         cfd_->internal_stats()->GetFileReadHist(fp.GetHitFileLevel()),
         IsFilterSkipped(static_cast<int>(fp.GetHitFileLevel()),
                         fp.IsHitFileLastInLevel()),
@@ -1419,11 +1485,10 @@ void Version::GetKey(const Slice& user_key, const Slice& ikey, Status* status,
   FdWithKeyRange* f = fp.GetNextFile();
 
   while (f != nullptr) {
-    *status =
-        table_cache_->Get(options, *internal_comparator(), *f->file_metadata,
-                          storage_info_.dependence_map(), ikey, &get_context,
-                          mutable_cf_options_.prefix_extractor.get(), nullptr,
-                          true, fp.GetCurrentLevel());
+    *status = table_cache_->Get(
+        options, *f->file_metadata, storage_info_.dependence_map(), ikey,
+        &get_context, mutable_cf_options_.prefix_extractor.get(), nullptr, true,
+        fp.GetCurrentLevel());
     if (!status->ok()) {
       return;
     }
@@ -1765,18 +1830,6 @@ void VersionStorageInfo::ComputeCompactionScore(
     }
   }
 
-  // Calculate total_garbage_ratio_ as criterion for NeedsGarbageCollection().
-  double num_entries = 0;
-  for (auto& f : LevelFiles(-1)) {
-    if (f->is_gc_forbidden()) {
-      continue;
-    }
-    total_garbage_ratio_ += f->num_antiquation;
-    num_entries += f->prop.num_entries;
-  }
-  total_garbage_ratio_ /= std::max<double>(1, num_entries);
-
-  is_pick_compaction_fail = false;
   ComputeFilesMarkedForCompaction();
   ComputeBottommostFilesMarkedForCompaction();
   if (mutable_cf_options.ttl > 0) {
@@ -1891,7 +1944,12 @@ void VersionStorageInfo::AddFile(int level, FileMetaData* f,
         }
       }
     }
+    if (f->prop.is_blob_wal()) {
+      blob_wal_dependence_.emplace_back(
+          f->fd.GetNumber(), f->prop.num_entries - f->num_antiquation);
+    }
   } else {
+    assert(!f->prop.is_blob_wal());
     if (f->prop.is_map_sst()) {
       space_amplification_[level] |= kHasMapSst;
     }
@@ -2815,11 +2873,48 @@ bool VersionStorageInfo::RangeMightExistAfterSortedRun(
   return false;
 }
 
+void VersionStorageInfo::UpdateGarbageCollectionInfo(
+    const std::unordered_map<uint64_t, uint64_t>& blob_wal_dependence_map) {
+  if (!blob_wal_dependence_.empty()) {
+    uint64_t new_blob_num_antiquation = 0;
+
+    for (auto f : files_[-1]) {
+      if (f->is_gc_forbidden()) {
+        continue;
+      }
+      if (f->prop.is_blob_wal()) {
+        auto find = blob_wal_dependence_map.find(f->fd.GetNumber());
+        assert(find != blob_wal_dependence_map.end());
+        if (find != blob_wal_dependence_map.end()) {
+          f->num_antiquation =
+              f->prop.num_entries - std::min(f->prop.num_entries, find->second);
+        }
+      }
+      new_blob_num_antiquation += f->num_antiquation;
+    }
+    blob_num_antiquation_ = new_blob_num_antiquation;
+  }
+  // Calculate total_garbage_ratio_ as criterion for NeedsGarbageCollection().
+  total_garbage_ratio_ =
+      blob_num_antiquation_ / std::max<double>(1, blob_num_entries_);
+
+  is_pick_compaction_fail = false;
+}
+
 void Version::AddLiveFiles(std::vector<FileDescriptor>* live) {
   for (int level = -1; level < storage_info_.num_levels(); level++) {
     const std::vector<FileMetaData*>& files = storage_info_.files_[level];
     for (const auto& file : files) {
       live->push_back(file->fd);
+    }
+  }
+}
+
+void Version::AddLiveFiles(std::vector<FileMetaData*>* live) {
+  for (int level = -1; level < storage_info_.num_levels(); level++) {
+    const std::vector<FileMetaData*>& files = storage_info_.files_[level];
+    for (const auto& file : files) {
+      live->push_back(file);
     }
   }
 }
@@ -2904,6 +2999,7 @@ VersionSet::VersionSet(const std::string& dbname,
       current_version_number_(0),
       manifest_file_size_(0),
       manifest_edit_count_(0),
+      has_blobwal_and_nonindex_(false),
       seq_per_batch_(seq_per_batch),
       env_options_(storage_options) {}
 
@@ -2960,6 +3056,7 @@ Status VersionSet::ProcessManifestWrites(
     std::deque<ManifestWriter>& writers, InstrumentedMutex* mu,
     Directory* db_directory, bool new_descriptor_log,
     const ColumnFamilyOptions* new_cf_options) {
+  // TODO: need summarize used entries of every blob wal to get num_antiquation
   assert(!writers.empty());
   ManifestWriter& first_writer = writers.front();
   ManifestWriter* last_writer = &first_writer;
@@ -3123,11 +3220,49 @@ Status VersionSet::ProcessManifestWrites(
     EnvOptions opt_env_opts = env_->OptimizeForManifestWrite(env_options_);
     mu->Unlock();
 
+    std::unordered_map<uint64_t, uint64_t> blob_wal_dependence_map;
+    std::vector<uint32_t> cfd_id;
+
+    auto collect_wal_entry_depend = [&](VersionStorageInfo* vstorage) {
+      for (auto& pair : vstorage->blob_wal_dependence()) {
+        blob_wal_dependence_map[pair.first] += pair.second;
+      }
+    };
     if (!first_writer.edit_list.front()->IsColumnFamilyManipulation()) {
       for (int i = 0; i < static_cast<int>(versions.size()); ++i) {
+        cfd_id.emplace_back(versions[i]->cfd()->GetID());
         assert(!builder_guards.empty() &&
                builder_guards.size() == versions.size());
-        builder_guards[i]->DoApplyAndSaveTo(versions[i]->storage_info());
+        builder_guards[i]->DoApplyAndSaveTo(versions[i]->storage_info(), this);
+        collect_wal_entry_depend(versions[i]->storage_info());
+      }
+
+      std::sort(cfd_id.begin(), cfd_id.end());
+      for (auto cfd : *column_family_set_) {
+        if (!cfd->initialized() ||
+            std::binary_search(cfd_id.begin(), cfd_id.end(), cfd->GetID())) {
+          continue;
+        }
+        collect_wal_entry_depend(cfd->current()->storage_info());
+      }
+      for (int i = 0; i < static_cast<int>(versions.size()); ++i) {
+        versions[i]->storage_info()->UpdateGarbageCollectionInfo(
+            blob_wal_dependence_map);
+      }
+
+      if (!blob_wal_dependence_map.empty()) {
+        for (auto cfd : *column_family_set_) {
+          if (!cfd->initialized() ||
+              std::binary_search(cfd_id.begin(), cfd_id.end(), cfd->GetID())) {
+            continue;
+          }
+          cfd->current()->storage_info()->UpdateGarbageCollectionInfo(
+              blob_wal_dependence_map);
+        }
+        SetWalWithoutIndex(true);
+        ROCKS_LOG_INFO(db_options_->info_log,
+                       "Set Wal Without Index #%" PRId64 "\n",
+                       blob_wal_dependence_map.size());
       }
     }
 
@@ -3276,6 +3411,11 @@ Status VersionSet::ProcessManifestWrites(
 
       if (last_min_log_number_to_keep != 0) {
         // Should only be set in 2PC mode.
+#ifndef NDEBUG
+        ROCKS_LOG_INFO(db_options_->info_log,
+                       "Update MinLogNumberToKeep2PC: %" PRId64,
+                       last_min_log_number_to_keep);
+#endif  // !NDEBUG
         MarkMinLogNumberToKeep2PC(last_min_log_number_to_keep);
       }
 
@@ -4444,8 +4584,8 @@ uint64_t VersionSet::ApproximateSize(Version* v, const FdWithKeyRange& f,
           TableCache* table_cache = v->cfd_->table_cache();
           Cache::Handle* handle = nullptr;
           auto s = table_cache->FindTable(
-              v->env_options_, v->cfd_->internal_comparator(), file_meta->fd,
-              &handle, v->GetMutableCFOptions().prefix_extractor.get());
+              v->env_options_, file_meta->fd, &handle,
+              v->GetMutableCFOptions().prefix_extractor.get());
           if (s.ok()) {
             table_reader_ptr = table_cache->GetTableReaderFromHandle(handle);
             result = table_reader_ptr->ApproximateOffsetOf(key);
@@ -4547,7 +4687,7 @@ InternalIterator* VersionSet::MakeInputIterator(
         const LevelFilesBrief* flevel = c->input_levels(which);
         for (size_t i = 0; i < flevel->num_files; i++) {
           list[num++] = cfd->table_cache()->NewIterator(
-              read_options, env_options_compactions, cfd->internal_comparator(),
+              read_options, env_options_compactions,
               *flevel->files[i].file_metadata, dependence_map, range_del_agg,
               c->mutable_cf_options()->prefix_extractor.get(),
               nullptr /* table_reader_ptr */,
@@ -4630,6 +4770,33 @@ bool VersionSet::VerifyCompactionFileConsistency(Compaction* c) {
   return true;  // everything good
 }
 
+bool VersionSet::PickBlobWalWithoutIndex(
+    std::vector<FileMetaData*>* picked_wals, InstrumentedMutex* mu) {
+  mu->AssertHeld();
+  bool found = false;
+  for (auto cfd_iter : *column_family_set_) {
+    if (!cfd_iter->initialized()) {
+      continue;
+    }
+    Version* version = cfd_iter->current();
+    const auto* vstorage = version->storage_info();
+    for (const auto& file : vstorage->LevelFiles(-1)) {
+      if (file->prop.is_blob_wal() &&
+          index_creating_ongoing_wals_.find(file->fd.GetNumber()) ==
+              index_creating_ongoing_wals_.end() &&
+          file->is_gc_defered()) {
+        picked_wals->push_back(file);
+        index_creating_ongoing_wals_.emplace(file->fd.GetNumber(), file);
+        found = true;
+      }
+    }
+  }
+  if (found) {
+    SetWalWithoutIndex(false);
+  }
+  return found;
+}
+
 Status VersionSet::GetMetadataForFile(uint64_t number, int* filelevel,
                                       FileMetaData** meta,
                                       ColumnFamilyData** cfd) {
@@ -4653,7 +4820,8 @@ Status VersionSet::GetMetadataForFile(uint64_t number, int* filelevel,
   return Status::NotFound("File not present in any level");
 }
 
-void VersionSet::GetLiveFilesMetaData(std::vector<LiveFileMetaData>* metadata) {
+void VersionSet::GetLiveFilesMetaData(std::vector<LiveFileMetaData>* metadata,
+                                      const std::string& wal_dir) {
   for (auto cfd : *column_family_set_) {
     if (cfd->IsDropped() || !cfd->initialized()) {
       continue;
@@ -4671,6 +4839,10 @@ void VersionSet::GetLiveFilesMetaData(std::vector<LiveFileMetaData>* metadata) {
           filemetadata.db_path = cfd->ioptions()->cf_paths.back().path;
         }
         filemetadata.name = MakeTableFileName("", file->fd.GetNumber());
+        if (file->prop.is_blob_wal()) {
+          filemetadata.name = LogFileName("", file->fd.GetNumber());
+          filemetadata.db_path = wal_dir;
+        }
         filemetadata.level = level;
         filemetadata.size = static_cast<size_t>(file->fd.GetFileSize());
         filemetadata.smallestkey = file->smallest.user_key().ToString();
@@ -4756,6 +4928,35 @@ uint64_t VersionSet::GetTotalSstFilesSize(Version* dummy_versions) {
     }
   }
   return total_files_size;
+}
+
+Status VersionSet::CacheWalMeta(uint64_t log_no, FileMetaData fm) {
+  log_meta_mutex_.Lock();
+  assert(log_meta_cache_.find(log_no) == log_meta_cache_.end());
+  log_meta_cache_[log_no] = fm;
+  log_meta_mutex_.Unlock();
+  return Status::OK();
+}
+
+Status VersionSet::ReleaseWalMeta(uint64_t log_no) {
+  log_meta_mutex_.Lock();
+  log_meta_cache_.erase(log_no);
+  log_meta_mutex_.Unlock();
+  return Status::OK();
+}
+
+FileMetaData VersionSet::GetWalMeta(uint64_t log_no) {
+  auto find = log_meta_cache_.find(log_no);
+  assert(find != log_meta_cache_.end());
+  return find->second;
+}
+
+TableProperties VersionSet::GetWalProp(uint64_t log_no) {
+  auto meta = GetWalMeta(log_no);
+  TableProperties tp;
+  tp.num_entries = meta.prop.num_entries;
+  tp.purpose = meta.prop.purpose;
+  return tp;
 }
 
 }  // namespace rocksdb

@@ -1,4 +1,5 @@
 #include "chaos_test.hpp"
+#include "rocksdb/advanced_options.h"
 
 namespace rocksdb {
 
@@ -50,7 +51,7 @@ class ChaosTest {
     options.allow_mmap_writes = false;
     options.allow_concurrent_memtable_write = true;
     options.use_direct_reads = true;
-    options.max_background_garbage_collections = 8;
+    options.max_background_garbage_collections = 6;
     options.WAL_size_limit_MB = 0;
     options.use_aio_reads = true;
     options.max_background_jobs = 32;
@@ -115,7 +116,7 @@ class ChaosTest {
     bbto.pin_top_level_index_and_filter = true;
     bbto.pin_l0_filter_and_index_blocks_in_cache = true;
     bbto.filter_policy.reset(NewBloomFilterPolicy(10, true));
-    bbto.block_cache = NewLRUCache(4ULL << 30, 6, false);
+    bbto.block_cache = NewLRUCache(4ULL << 10, 6, false);
 
     options.compaction_pri = kMinOverlappingRatio;
     options.compression = kZSTD;
@@ -214,6 +215,7 @@ class ChaosTest {
           rocksdb::NewTerarkZipTableFactory(tzto, options.table_factory));
     }
 #endif
+    wo.enable_kv_separate = true;
   }
 
   std::pair<std::string, std::string> get_ran_range_pair(
@@ -410,10 +412,11 @@ class ChaosTest {
           }
         }
       }
-      if (std::uniform_int_distribution<uint64_t>(0, 1 << 10)(mt) == 0) {
+//      if (std::uniform_int_distribution<uint64_t>(0, 1 << 10)(mt) == 0) {
+      if (true) {
         auto s = db->Write(wo, b.GetWriteBatch());
         if (!s.ok()) {
-          printf("%s\n", s.getState());
+          printf("%s\n", s.ToString().c_str());
           break;
         }
         b.Clear();
@@ -784,16 +787,16 @@ class ChaosTest {
     for (int i = 0; i < cf_num; ++i) {
       options.compaction_style = rocksdb::kCompactionStyleLevel;
       options.write_buffer_size = size_t(file_size_base * 1.2);
-      options.enable_lazy_compaction = true;
+      options.enable_lazy_compaction = false;
       cfDescriptors.emplace_back(rocksdb::kDefaultColumnFamilyName, options);
-      options.compaction_style = rocksdb::kCompactionStyleUniversal;
-      options.write_buffer_size = size_t(file_size_base * 1.1);
-      options.enable_lazy_compaction = true;
-      cfDescriptors.emplace_back("universal" + std::to_string(i), options);
-      options.compaction_style = rocksdb::kCompactionStyleLevel;
-      options.write_buffer_size = size_t(file_size_base / 1.1);
-      options.enable_lazy_compaction = true;
-      cfDescriptors.emplace_back("level" + std::to_string(i), options);
+//      options.compaction_style = rocksdb::kCompactionStyleUniversal;
+//      options.write_buffer_size = size_t(file_size_base * 1.1);
+//      options.enable_lazy_compaction = true;
+//      cfDescriptors.emplace_back("universal" + std::to_string(i), options);
+//      options.compaction_style = rocksdb::kCompactionStyleLevel;
+//      options.write_buffer_size = size_t(file_size_base / 1.1);
+//      options.enable_lazy_compaction = true;
+//      cfDescriptors.emplace_back("level" + std::to_string(i), options);
     }
     if (flags_ & TestWorker) {
       options.compaction_dispatcher.reset(
@@ -861,9 +864,10 @@ class ChaosTest {
               ctx.count, ctx.seqno, ctx.key.c_str(), err);
       fprintf(stderr, "Get:\n");
       for (size_t i = 0; i < hs.size(); ++i) {
-        fprintf(stderr, "s%zd = %s, v%zd = %s\n", i,
+        fprintf(stderr, "s%zd = %s, k%zd = %s, v%zd = %s\n", i,
                 ctx.ss.size() > i ? ctx.ss[i].ToString().c_str() : "null", i,
-                ctx.values.size() > i ? ctx.values[i].c_str() : "null");
+                ctx.keys.size() > i ? ctx.keys[i].ToString().c_str() : "null",
+                i, ctx.values.size() > i ? ctx.values[i].c_str() : "null");
       }
       if (flags_ & TestIter) {
         fprintf(stderr, "Iter:\n");

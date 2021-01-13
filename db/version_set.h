@@ -31,7 +31,6 @@
 
 #include "db/column_family.h"
 #include "db/compaction.h"
-#include "db/compaction_picker.h"
 #include "db/dbformat.h"
 #include "db/file_indexer.h"
 #include "db/log_reader.h"
@@ -39,7 +38,6 @@
 #include "db/read_callback.h"
 #include "db/table_cache.h"
 #include "db/version_builder.h"
-#include "db/version_edit.h"
 #include "db/write_controller.h"
 #include "monitoring/instrumented_mutex.h"
 #include "options/db_options.h"
@@ -268,6 +266,9 @@ class VersionStorageInfo {
   bool IsPickGarbageCollectionFail() const {
     return is_pick_garbage_collection_fail;
   }
+  bool IsPickWalIndexCreationFail() const {
+    return is_pick_wal_index_creation_fail;
+  }
 
   int num_levels() const { return num_levels_; }
 
@@ -333,6 +334,11 @@ class VersionStorageInfo {
 
   // REQUIRES: This version has been saved (see VersionSet::SaveTo)
   const DependenceMap& dependence_map() const { return dependence_map_; }
+
+  // REQUIRES: This version has been saved (see VersionSet::SaveTo)
+  const std::vector<std::pair<uint64_t, uint64_t>>& blob_wal_dependence() {
+    return blob_wal_dependence_;
+  }
 
   const rocksdb::LevelFilesBrief& LevelFilesBrief(int level) const {
     assert(level < static_cast<int>(level_files_brief_.size()));
@@ -487,6 +493,9 @@ class VersionStorageInfo {
                                      const Slice& largest_user_key,
                                      int last_level, int last_l0_idx);
 
+  void UpdateGarbageCollectionInfo(
+      const std::unordered_map<uint64_t, uint64_t>& blob_wal_dependence_map);
+
  private:
   const InternalKeyComparator* internal_comparator_;
   const Comparator* user_comparator_;
@@ -575,10 +584,11 @@ class VersionStorageInfo {
 
   enum {
     kHasMapSst = 1ULL << 0,
-    kHasRangeDeletion = 1ULL << 1,
+    kHasRangeDeletion = 1ULL << 2,
   };
   std::unordered_map<int, int> space_amplification_;
   std::vector<double> read_amplification_;
+  std::vector<std::pair<uint64_t, uint64_t>> blob_wal_dependence_;
 
   int l0_delay_trigger_count_ = 0;  // Count used to trigger slow down and stop
                                     // for number of L0 files.
@@ -601,6 +611,7 @@ class VersionStorageInfo {
 
   bool is_pick_compaction_fail;
   bool is_pick_garbage_collection_fail;
+  bool is_pick_wal_index_creation_fail;
 
   // If set to true, we will run consistency checks even if RocksDB
   // is compiled in release mode
@@ -669,6 +680,7 @@ class Version : public SeparateHelper, private LazyBufferState {
 
   // Add all files listed in the current version to *live.
   void AddLiveFiles(std::vector<FileDescriptor>* live);
+  void AddLiveFiles(std::vector<FileMetaData*>* live);
 
   // Return a human readable string that describes this version's contents.
   std::string DebugString(bool hex = false, bool print_stats = false) const;
@@ -798,7 +810,7 @@ class Version : public SeparateHelper, private LazyBufferState {
   Status fetch_buffer(LazyBuffer* buffer) const override;
 
   LazyBuffer TransToCombined(const Slice& user_key, uint64_t sequence,
-                             const LazyBuffer& value) const override;
+                             LazyBuffer&& value) const override;
 
   // No copying allowed
   Version(const Version&);
@@ -1059,7 +1071,8 @@ class VersionSet {
                             FileMetaData** metadata, ColumnFamilyData** cfd);
 
   // This function doesn't support leveldb SST filenames
-  void GetLiveFilesMetaData(std::vector<LiveFileMetaData>* metadata);
+  void GetLiveFilesMetaData(std::vector<LiveFileMetaData>* metadata,
+                            const std::string& wal_dir);
 
   void GetObsoleteFiles(std::vector<ObsoleteFileInfo>* files,
                         std::vector<std::string>* manifest_filenames,
@@ -1074,6 +1087,22 @@ class VersionSet {
 
   const ImmutableDBOptions* db_options() const { return db_options_; }
 
+  void LogAndApplyHelper(ColumnFamilyData* cfd, VersionBuilder* b, Version* v,
+                         VersionEdit* edit, InstrumentedMutex* mu,
+                         bool apply = true);
+
+  Status CacheWalMeta(uint64_t log_no, FileMetaData fm);
+  Status ReleaseWalMeta(uint64_t log_no);
+  FileMetaData GetWalMeta(uint64_t log_no);
+  TableProperties GetWalProp(uint64_t log_no);
+  bool PickBlobWalWithoutIndex(std::vector<FileMetaData*>* picked_wals,
+                               InstrumentedMutex* mu);
+  void SetWalWithoutIndex(bool flag) {
+    has_blobwal_and_nonindex_.store(flag, std::memory_order_relaxed);
+  }
+  bool HasWalWithoutIndex() {
+    return has_blobwal_and_nonindex_.load(std::memory_order_relaxed);
+  }
   static uint64_t GetNumLiveVersions(Version* dummy_versions);
 
   static uint64_t GetTotalSstFilesSize(Version* dummy_versions);
@@ -1174,6 +1203,14 @@ class VersionSet {
   std::vector<ObsoleteFileInfo> obsolete_files_;
   std::vector<std::string> obsolete_manifests_;
 
+  std::unordered_map<uint64_t, FileMetaData*> index_creating_ongoing_wals_;
+
+  // after switchmem, a new static wal is created, then need to create its index
+  std::atomic<bool> has_blobwal_and_nonindex_;
+
+  // cache log_meta until all dependence sst of this log flushed
+  std::unordered_map<uint64_t, FileMetaData> log_meta_cache_;
+  InstrumentedMutex log_meta_mutex_;
   const bool seq_per_batch_;
 
   // env options for all reads and writes except compactions
@@ -1184,11 +1221,6 @@ class VersionSet {
   void operator=(const VersionSet&);
 
   void LogAndApplyCFHelper(VersionEdit* edit);
-
- public:
-  void LogAndApplyHelper(ColumnFamilyData* cfd, VersionBuilder* b, Version* v,
-                         VersionEdit* edit, InstrumentedMutex* mu,
-                         bool apply = true);
 };
 
 }  // namespace rocksdb

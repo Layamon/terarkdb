@@ -782,16 +782,18 @@ void CompactionPicker::GetGrandparents(
 // Try to perform garbage collection from certain column family.
 // Resulting as a pointer of compaction, nullptr as nothing to do.
 Compaction* CompactionPicker::PickGarbageCollection(
-    const std::string& /*cf_name*/, const MutableCFOptions& mutable_cf_options,
-    VersionStorageInfo* vstorage, LogBuffer* /*log_buffer*/) {
+    const std::string& /*cf_name*/, uint64_t min_log_number_to_keep,
+    const MutableCFOptions& mutable_cf_options, VersionStorageInfo* vstorage,
+    LogBuffer* /*log_buffer*/) {
   std::vector<GarbageFileInfo> gc_files;
 
   // Setting fragment_size as one eighth max_file_size prevents selecting
   // massive files to single compaction which would pin down the maximum
   // deletable file number for a long time resulting possible storage leakage.
-  size_t max_file_size =
+  uint64_t max_file_size =
       MaxFileSizeForLevel(mutable_cf_options, 1, ioptions_.compaction_style);
-  size_t fragment_size = max_file_size / 8;
+  uint64_t fragment_size = max_file_size / 8;
+  uint64_t max_pick_size = max_file_size * 8;
 
   // Traverse level -1 to filter out all blob sstables needs GC.
   // 1. score more than garbage collection baseline.
@@ -799,6 +801,10 @@ Compaction* CompactionPicker::PickGarbageCollection(
   // 3. marked for compaction for other reasons
   for (auto f : vstorage->LevelFiles(-1)) {
     if (!f->is_gc_permitted() || f->being_compacted) {
+      continue;
+    }
+    if (f->prop.is_blob_wal() &&
+        (f->fd.GetNumber() >= min_log_number_to_keep || f->is_gc_defered())) {
       continue;
     }
     GarbageFileInfo info = {f};
@@ -836,19 +842,24 @@ Compaction* CompactionPicker::PickGarbageCollection(
   gc_files.front().f->set_gc_candidate();
 
   uint64_t total_estimate_size = gc_files.front().estimate_size;
+  uint64_t total_pick_size = gc_files.front().f->fd.file_size;
   uint64_t num_antiquation = gc_files.front().f->num_antiquation;
   for (auto it = std::next(gc_files.begin()); it != gc_files.end(); ++it) {
     auto& info = *it;
-    if (total_estimate_size + info.estimate_size > max_file_size) {
+    if ((total_estimate_size + info.estimate_size > max_file_size ||
+         total_pick_size + info.f->num_antiquation > max_pick_size)
+#ifndef NDEBUG
+        // triger wal gc aggressively in debug
+        && !info.f->prop.is_blob_wal()
+#endif  // !NDEBUG
+    ) {
       continue;
     }
     total_estimate_size += info.estimate_size;
+    total_pick_size = gc_files.front().f->fd.file_size;
     num_antiquation += info.f->num_antiquation;
     input.files.push_back(info.f);
     info.f->set_gc_candidate();
-    if (input.size() >= 8) {
-      break;
-    }
   }
 
   int bottommost_level = vstorage->num_levels() - 1;
@@ -885,7 +896,7 @@ void CompactionPicker::InitFilesBeingCompact(
                          const DependenceMap& depend_map, Arena* arena,
                          TableReader** table_reader_ptr) {
     return table_cache_->NewIterator(
-        options, env_options_, *icmp_, *file_metadata, depend_map, nullptr,
+        options, env_options_, *file_metadata, depend_map, nullptr,
         mutable_cf_options.prefix_extractor.get(), table_reader_ptr, nullptr,
         false, arena, true, -1);
   };
@@ -1190,7 +1201,7 @@ Compaction* CompactionPicker::PickRangeCompaction(
                          const DependenceMap& depend_map, Arena* arena,
                          TableReader** table_reader_ptr) {
     return table_cache_->NewIterator(
-        options, env_options_, *icmp_, *file_metadata, depend_map, nullptr,
+        options, env_options_, *file_metadata, depend_map, nullptr,
         mutable_cf_options.prefix_extractor.get(), table_reader_ptr, nullptr,
         false, arena, true, -1);
   };
@@ -1707,7 +1718,7 @@ Compaction* CompactionPicker::PickCompositeCompaction(
   DependenceMap empty_dependence_map;
   ReadOptions options;
   ScopedArenaIterator iter(table_cache_->NewIterator(
-      options, env_options_, *icmp_, *input.files.front(), empty_dependence_map,
+      options, env_options_, *input.files.front(), empty_dependence_map,
       nullptr, mutable_cf_options.prefix_extractor.get(), nullptr, nullptr,
       false, &arena, true, input.level));
   if (!iter->status().ok()) {
@@ -1952,8 +1963,7 @@ Compaction* CompactionPicker::PickBottommostLevelCompaction(
     }
     std::shared_ptr<const TableProperties> tp;
     auto s = table_cache_->GetTableProperties(
-        env_options_, *icmp_, *f, &tp,
-        mutable_cf_options.prefix_extractor.get(), true);
+        env_options_, *f, &tp, mutable_cf_options.prefix_extractor.get(), true);
     if (s.IsIncomplete()) {
       return f->fd.largest_seqno < oldest_snapshot_seqnum;
     }
@@ -2505,8 +2515,7 @@ Compaction* LevelCompactionBuilder::PickLazyCompaction(
                            const DependenceMap& depend_map, Arena* arena,
                            TableReader** table_reader_ptr) {
       return picker->table_cache()->NewIterator(
-          options, picker->env_options(), ioptions_.internal_comparator,
-          *file_metadata, depend_map, nullptr,
+          options, picker->env_options(), *file_metadata, depend_map, nullptr,
           mutable_cf_options_.prefix_extractor.get(), table_reader_ptr, nullptr,
           false, arena, true, -1);
     };
@@ -2726,8 +2735,7 @@ Compaction* LevelCompactionBuilder::PickLazyCompaction(
                            const DependenceMap& depend_map, Arena* arena,
                            TableReader** table_reader_ptr) {
       return picker->table_cache()->NewIterator(
-          options, picker->env_options(), ioptions_.internal_comparator,
-          *file_metadata, depend_map, nullptr,
+          options, picker->env_options(), *file_metadata, depend_map, nullptr,
           mutable_cf_options_.prefix_extractor.get(), table_reader_ptr, nullptr,
           false, arena, true, -1);
     };

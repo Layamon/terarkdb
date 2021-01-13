@@ -8,6 +8,8 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 #include "db/dbformat.h"
 
+#include "db/log_format.h"
+
 #ifndef __STDC_FORMAT_MACROS
 #define __STDC_FORMAT_MACROS
 #endif
@@ -15,6 +17,8 @@
 #include <inttypes.h>
 #include <stdio.h>
 
+#include "db/log_writer.h"
+#include "db/write_batch_internal.h"
 #include "monitoring/perf_context_imp.h"
 #include "port/port.h"
 #include "util/coding.h"
@@ -241,6 +245,99 @@ Slice ArenaPinInternalKey(const Slice& user_key, SequenceNumber seq,
   EncodeFixed64(buf + user_key.size(), PackSequenceAndType(seq, type));
   buf[key_size] = '\0';  // better for debug read
   return Slice(buf, key_size);
+}
+
+ValueIndex::ValueIndex(const Slice& slice) {
+  assert(slice.size() >= sizeof(uint64_t));
+  uint64_t packed_log_number = DecodeFixed64(slice.data());
+  log_type = (LogHandleType)(packed_log_number & kLogHandleTypeMask);
+  file_number = packed_log_number & kFileNumberMask;
+
+  switch (log_type) {
+    case kEmpty:
+      meta_or_value = Slice(slice.data() + 8, slice.size() - 8);
+      break;
+    case kDefault: {
+      assert(slice.size() >= kDefaultLogIndexSize);
+      log_handle = Slice(slice.data() + 8, kDefaultLogHandleSize);
+      meta_or_value = Slice(slice.data() + kDefaultLogIndexSize,
+                            slice.size() - kDefaultLogIndexSize);
+    } break;
+    case kReverse0:
+    case kReverse1: {
+      assert(false);
+    } break;
+  }
+}
+
+size_t GetPhysicalLength(uint64_t logical_length, uint64_t physical_offset,
+                         uint64_t wal_header_size) {
+  // physical_offset is data size ahead of current data, it can end at tail of
+  // last block exactly which make it be zero. when it is 0, first block has no
+  // remain space
+  assert(physical_offset == 0 || physical_offset >= wal_header_size);
+  if (logical_length == 0) {
+    return 0;
+  }
+
+  size_t first_block_remain_size =
+      (log::kBlockSize - physical_offset % log::kBlockSize) % log::kBlockSize;
+
+  size_t block_avail_size = log::kBlockSize - wal_header_size;
+  return logical_length +
+         wal_header_size * ((block_avail_size - 1 + logical_length -
+                             first_block_remain_size) /
+                            block_avail_size);
+}
+
+uint64_t GetPhysicalOffset(uint64_t ahead_data_offset, size_t ahead_data_size,
+                           size_t header_size) {
+  assert(header_size == log::kHeaderSize);  // forbid recycle log
+
+  size_t ahead_data_physical_size =
+      GetPhysicalLength(ahead_data_size, ahead_data_offset, header_size);
+  uint64_t result = ahead_data_offset + ahead_data_physical_size;
+  if (0 == (ahead_data_offset + ahead_data_physical_size) % log::kBlockSize) {
+    // ahead value data end exactly at one block's tail, current value need a
+    // header
+    result += header_size;
+  }
+  return result;
+}
+
+// "record" refer to a logical record of wal which is a whole writebatch
+// "entry" refer to a logical key-value-pair in write batch
+uint64_t GetFirstEntryPhysicalOffset(uint64_t batch_record_offset,
+                                     uint64_t header_size, uint64_t avail_) {
+  uint64_t avail = log::kBlockSize - batch_record_offset % log::kBlockSize -
+                   log::kHeaderSize;
+  assert(avail == avail_);
+  if (WriteBatchInternal::kHeader >= avail) {
+    // write batch's header cross blocks, so it makes we need add two header
+    // before first entry in this write batch
+    return batch_record_offset + WriteBatchInternal::kHeader + 2 * header_size;
+  } else {
+    return batch_record_offset + WriteBatchInternal::kHeader + header_size;
+  }
+}
+
+uint64_t GetAheadDataOffset(uint64_t cur_offset,
+                            uint64_t ahead_data_size_with_header,
+                            uint64_t header_size, bool is_cleared) {
+  uint64_t ahead_data_size =
+      ahead_data_size_with_header - WriteBatchInternal::kHeader;
+  if (cur_offset == 0 || is_cleared) return uint64_t(-1);
+  assert(cur_offset > log::kHeaderSize);  // must have ahead data
+  uint64_t tail_data_size = cur_offset % log::kBlockSize - header_size;
+  uint64_t ahead_block_count =
+      (ahead_data_size - tail_data_size) % log::kBlockSize;
+  uint64_t ahead_content_physical_offset =
+      cur_offset - ahead_data_size - ahead_block_count * header_size -
+                  tail_data_size >
+              0
+          ? header_size
+          : 0;
+  return ahead_content_physical_offset;
 }
 
 }  // namespace rocksdb

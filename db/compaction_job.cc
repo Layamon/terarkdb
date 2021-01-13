@@ -1028,9 +1028,9 @@ Status CompactionJob::VerifyFiles() {
       // to cache it here for further user reads
       auto output_level = compact_->compaction->output_level();
       InternalIterator* iter = cfd->table_cache()->NewIterator(
-          ReadOptions(), env_options_, cfd->internal_comparator(),
-          *files_meta[file_idx], empty_dependence_map,
-          nullptr /* range_del_agg */, prefix_extractor, nullptr,
+          ReadOptions(), env_options_, *files_meta[file_idx],
+          empty_dependence_map, nullptr /* range_del_agg */, prefix_extractor,
+          nullptr,
           output_level == -1
               ? nullptr
               : cfd->internal_stats()->GetFileReadHist(output_level),
@@ -1263,6 +1263,11 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
         sub_compact->compaction->CreateCompactionFilter();
     compaction_filter = compaction_filter_from_factory.get();
   }
+
+  CompactionSeparateHelper separate_helper;
+  // since merge may contain value from separate_helper, put merge after
+  // separate helper make sure deconstructor of merge happen before
+  // separate_helper
   MergeHelper merge(
       env_, cfd->user_comparator(), cfd->ioptions()->merge_operator,
       compaction_filter, db_options_.info_log.get(),
@@ -1271,34 +1276,6 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
       snapshot_checker_, compact_->compaction->level(),
       db_options_.statistics.get(), shutting_down_);
 
-  struct BuilderSeparateHelper : public SeparateHelper {
-    SeparateHelper* separate_helper = nullptr;
-    std::unique_ptr<ValueExtractor> value_meta_extractor;
-    Status (*trans_to_separate_callback)(void* args, const Slice& key,
-                                         LazyBuffer& value) = nullptr;
-    void* trans_to_separate_callback_args = nullptr;
-
-    Status TransToSeparate(const Slice& internal_key, LazyBuffer& value,
-                           const Slice& meta, bool is_merge,
-                           bool is_index) override {
-      return SeparateHelper::TransToSeparate(
-          internal_key, value, value.file_number(), meta, is_merge, is_index,
-          value_meta_extractor.get());
-    }
-
-    Status TransToSeparate(const Slice& key, LazyBuffer& value) override {
-      if (trans_to_separate_callback == nullptr) {
-        return Status::NotSupported();
-      }
-      return trans_to_separate_callback(trans_to_separate_callback_args, key,
-                                        value);
-    }
-
-    LazyBuffer TransToCombined(const Slice& user_key, uint64_t sequence,
-                               const LazyBuffer& value) const override {
-      return separate_helper->TransToCombined(user_key, sequence, value);
-    }
-  } separate_helper;
   if (compact_->compaction->immutable_cf_options()
           ->value_meta_extractor_factory != nullptr) {
     ValueExtractorContext context = {cfd->GetID()};
@@ -1480,6 +1457,24 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
     }
     assert(sub_compact->builder != nullptr);
     assert(sub_compact->current_output() != nullptr);
+
+#ifndef NDEBUG
+    if (c_iter->ikey().type == kTypeValueIndex ||
+        c_iter->ikey().type == kTypeMergeIndex) {
+      auto s = value.fetch();
+      if (!s.ok()) {
+        break;
+      }
+      ValueIndex value_index(value.slice());
+      if (value_index.log_type == ValueIndex::kDefault) {
+        DefaultLogHandle content(value_index.log_handle);
+        assert(content.length != 0);
+      } else {
+        assert(!value_index.log_handle.valid());
+      }
+    }
+#endif  // !NDEBUG
+
     status = sub_compact->builder->Add(key, value);
     if (!status.ok()) {
       break;
@@ -1877,6 +1872,7 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
     auto& meta = sub_compact->blob_outputs.front().meta;
     auto& inputs = *sub_compact->compaction->inputs();
     assert(inputs.size() == 1 && inputs.front().level == -1);
+    auto& level_inputs = inputs.front().files;
     ROCKS_LOG_INFO(
         db_options_.info_log,
         "[%s] [JOB %d] Table #%" PRIu64 " GC: %" PRIu64
@@ -1885,12 +1881,17 @@ void CompactionJob::ProcessGarbageCollection(SubcompactionState* sub_compact) {
         " get not found, %" PRIu64
         " file number mismatch ], inheritance chain: %" PRIu64 " -> %" PRIu64,
         cfd->GetName().c_str(), job_id_, meta.fd.GetNumber(), counter.input,
-        inputs.front().size(), counter.input - meta.prop.num_entries,
-        sub_compact->compaction->num_antiquation() * 100. / counter.input,
+        level_inputs.size(), counter.input - meta.prop.num_entries,
+        sub_compact->compaction->num_antiquation() * 100. /
+            std::max<double>(1, counter.input),
         counter.garbage_type, counter.get_not_found,
         counter.file_number_mismatch, raw_chain_length,
         inheritance_chain.size());
-    if (counter.input == meta.prop.num_entries || meta.prop.num_entries == 0) {
+    if ((counter.input == meta.prop.num_entries && level_inputs.size() == 1 &&
+         !level_inputs.front()->prop.is_blob_wal()) ||
+        meta.prop.num_entries == 0) {
+      // drop output when output has no data, or single normal sst into single
+      // normal sst(permit single blob wal into  normal sst)
       ROCKS_LOG_INFO(db_options_.info_log,
                      "[%s] [JOB %d] Table #%" PRIu64
                      " GC purge %s records, dropped",
@@ -2346,8 +2347,8 @@ Status CompactionJob::InstallCompactionResults(
         // test map sst
         DependenceMap empty_dependence_map;
         InternalIterator* iter = cfd->table_cache()->NewIterator(
-            ReadOptions(), env_options_, cfd->internal_comparator(),
-            o.file_meta, empty_dependence_map, nullptr /* range_del_agg */,
+            ReadOptions(), env_options_, o.file_meta, empty_dependence_map,
+            nullptr /* range_del_agg */,
             mutable_cf_options.prefix_extractor.get(), nullptr,
             cfd->internal_stats()->GetFileReadHist(compaction->output_level()),
             false, nullptr /* arena */, false /* skip_filters */,
@@ -2425,8 +2426,8 @@ Status CompactionJob::InstallCompactionResults(
       // test map sst
       DependenceMap empty_dependence_map;
       InternalIterator* iter = cfd->table_cache()->NewIterator(
-          ReadOptions(), env_options_, cfd->internal_comparator(), file_meta,
-          empty_dependence_map, nullptr /* range_del_agg */,
+          ReadOptions(), env_options_, file_meta, empty_dependence_map,
+          nullptr /* range_del_agg */,
           mutable_cf_options.prefix_extractor.get(), nullptr,
           cfd->internal_stats()->GetFileReadHist(compaction->output_level()),
           false, nullptr /* arena */, false /* skip_filters */,
@@ -2861,7 +2862,8 @@ void CompactionJob::LogCompaction() {
       stream << ("files_L" + ToString(compaction->level(i)));
       stream.StartArray();
       for (auto f : *compaction->inputs(i)) {
-        stream << f->fd.GetNumber();
+        stream << std::to_string(f->fd.GetNumber()) +
+                      (f->prop.is_blob_wal() ? "(wal)" : "(sst)");
       }
       stream.EndArray();
     }

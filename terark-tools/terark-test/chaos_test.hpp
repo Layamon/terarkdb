@@ -80,14 +80,14 @@ DEFINE_bool(terark, false, "test Terark Table");
 DEFINE_bool(compactrange, false, "test CompactRange");
 DEFINE_bool(rangedel, false, "test RangeDel");
 DEFINE_bool(hash, false, "test Hash(key) after Compaction");
-DEFINE_int32(write_thread, 2, "the number of write thread.");
-DEFINE_int32(read_thread, 20, "the number of read thread.");
+DEFINE_int32(write_thread, 12, "the number of write thread.");
+DEFINE_int32(read_thread, 4, "the number of read thread.");
 DEFINE_int32(cf_num, 1, "the number of column family");
 DEFINE_int32(value_avg_size, 2048, "the average size of value");
 DEFINE_int32(key_avg_size, 64, "the average size of key");
 
 const size_t file_size_base = 64ull << 20;
-const size_t blob_size = 2048;
+const size_t blob_size = 32;
 const size_t key_mode_nums = 2;
 const size_t value_avg_size = FLAGS_value_avg_size;
 const size_t key_avg_size = FLAGS_key_avg_size;
@@ -264,17 +264,17 @@ bool AllSame(std::vector<T> &left, std::vector<V> &right, F &&f) {
 
 std::string get_seq_key(size_t i) {
   char buffer[32];
-  snprintf(buffer, sizeof buffer, "%012zd", i);
+  snprintf(buffer, sizeof buffer, "k%012zd", i);
   return buffer;
 }
 
 std::string get_rnd_key(size_t r) {
   std::mt19937_64 mt(r);
-  char buffer[65];
-  snprintf(buffer + 0, 17, "%016lX", mt());
-  snprintf(buffer + 16, 17, "%016lX", mt());
-  snprintf(buffer + 32, 17, "%016lX", mt());
-  snprintf(buffer + 48, 17, "%016lX", mt());
+  char buffer[66];
+  snprintf(buffer + 0, 18, "k%016lX", mt());
+  snprintf(buffer + 17, 17, "%016lX", mt());
+  snprintf(buffer + 33, 17, "%016lX", mt());
+  snprintf(buffer + 49, 17, "%016lX", mt());
   // uint64_t v = mt();
   // memcpy(buffer + 8, &v, sizeof v);
   return std::string(buffer,

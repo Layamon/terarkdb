@@ -62,7 +62,7 @@ bool MemWriterToken::init_value(void* valptr, size_t valsize) noexcept {
     if (value_loc == MainPatricia::mem_alloc_fail) break;
     auto value_enc = (char*)trie->mem_get(value_loc);
     auto value_dst = EncodeVarint32(value_enc, (uint32_t)value_.size());
-    memcpy(value_dst, value_.data(), value_.size());
+    value_.dump(value_dst, value_.size());
     auto* data = (details::tag_vector_t::data_t*)trie->mem_get(data_loc);
     data->loc = (uint32_t)value_loc;
     data->tag = tag_;
@@ -286,7 +286,7 @@ MemTableRep::Iterator* PatriciaTrieRep::GetIterator(Arena* arena) {
 }
 
 bool PatriciaTrieRep::InsertKeyValue(const Slice& internal_key,
-                                     const Slice& value) {
+                                     const SliceParts& value) {
   TERARK_VERIFY(!immutable_);
   // immutable check
   // if (immutable_) return false;
@@ -311,7 +311,9 @@ bool PatriciaTrieRep::InsertKeyValue(const Slice& internal_key,
       }
       auto valptr = (char*)trie->mem_get(value_loc);
       valptr = EncodeVarint32(valptr, (uint32_t)value.size());
-      memcpy(valptr, value.data(), value.size());
+      for (int i = 0; i < value.num_parts; ++i) {
+        memcpy(valptr, value.parts[i].data(), value.parts[i].size());
+      }
       uint64_t size_loc;
       // row lock: infinite spin on LOCK_FLAG
       do {
